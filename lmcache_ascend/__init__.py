@@ -365,6 +365,9 @@ def _patch_storage_manager():
 
     # First Party
     from lmcache_ascend.v1.storage_backend.storage_manager import (
+        allocate_and_copy_objects as ascend_allocate_and_copy_objects,
+    )
+    from lmcache_ascend.v1.storage_backend.storage_manager import (
         batched_get as ascend_batched_get,
     )
     from lmcache_ascend.v1.storage_backend.storage_manager import get as ascend_get
@@ -373,6 +376,7 @@ def _patch_storage_manager():
         local_disk_touch_cache,
     )
 
+    lm_storage_manager.allocate_and_copy_objects = ascend_allocate_and_copy_objects
     lm_storage_manager.StorageManager.get = ascend_get
     lm_storage_manager.StorageManager.batched_get = ascend_batched_get
     lm_local_cpu_backend.LocalCPUBackend.touch_cache = local_cpu_touch_cache
