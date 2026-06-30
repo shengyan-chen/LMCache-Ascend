@@ -600,10 +600,96 @@ async def release_prefiller(
         return prefiller_state.snapshot()
 
 
+def _format_metric(value, digits: int = 3) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.{digits}f}"
+    return str(value)
+
+
+def _format_prefiller_active(state: dict) -> str:
+    if not state:
+        return "-"
+    return (
+        f"{state.get('active_prefill_requests', '-')}"
+        f"req/{state.get('active_prefill_tokens', '-')}tok"
+    )
+
+
+def _format_prefiller_candidate(state: dict) -> str:
+    name = state.get("name", "-")
+    host = state.get("host", "-")
+    port = state.get("port", "-")
+    return (
+        f"{name}@{host}:{port}"
+        f"(load={state.get('load_score', '-')},"
+        f"active={_format_prefiller_active(state)},"
+        f"total={state.get('total_prefill_requests', '-')}req/"
+        f"{state.get('total_prefill_tokens', '-')}tok,"
+        f"failed={state.get('failed_prefill_requests', '-')},"
+        f"last_ms={_format_metric(state.get('last_prefill_ms'))},"
+        f"ewma_ms={_format_metric(state.get('prefill_ms_ewma'))})"
+    )
+
+
+def _format_candidate_prefillers(candidate_loads: list[dict]) -> str:
+    if not candidate_loads:
+        return "[]"
+    return "[" + "; ".join(
+        _format_prefiller_candidate(state) for state in candidate_loads
+    ) + "]"
+
+
+def _format_route_summary(event: str, payload: dict) -> str:
+    selected_state = payload.get("selected_prefiller_state_after") or {}
+    released_state = payload.get("prefiller_state_after_release") or {}
+    active_state = released_state or selected_state
+
+    lines = [
+        "===============================",
+        f"Proxy route event: {event}",
+        f" - req_id: {payload.get('req_id', '-')}",
+        f" - endpoint: {payload.get('endpoint', '-')}",
+        f" - chosen_prefiller: {payload.get('chosen_prefiller', '-')}",
+        f" - chosen_decoder: {payload.get('chosen_decoder', '-')}",
+        f" - prompt_token_count: {payload.get('prompt_token_count', '-')}",
+        f" - prefill_ms: {_format_metric(payload.get('prefill_ms'))}",
+        f" - pd_slot_count: {payload.get('pd_slot_count', '-')}",
+        f" - pd_slot_wait_ms: {_format_metric(payload.get('pd_slot_wait_ms'))}",
+        " - prefiller_load_before: "
+        f"{payload.get('selected_prefiller_load_before', '-')}",
+        " - prefiller_load_after_select: "
+        f"{selected_state.get('load_score', '-')}",
+        " - prefiller_load_after_release: "
+        f"{released_state.get('load_score', '-')}",
+        f" - prefiller_active_current: {_format_prefiller_active(active_state)}",
+        " - candidate_prefiller_loads: "
+        f"{_format_candidate_prefillers(payload.get('candidate_prefiller_loads', []))}",
+    ]
+
+    if payload.get("kv_ready_wait_ms") is not None:
+        lines.append(
+            f" - kv_ready_wait_ms: {_format_metric(payload['kv_ready_wait_ms'])}"
+        )
+    if payload.get("decode_stream_ms") is not None:
+        lines.append(
+            f" - decode_stream_ms: {_format_metric(payload['decode_stream_ms'])}"
+        )
+    if payload.get("total_ms") is not None:
+        lines.append(f" - total_ms: {_format_metric(payload['total_ms'])}")
+    if payload.get("error") is not None:
+        lines.append(f" - error: {payload['error'] or '-'}")
+
+    lines.append(" ===============================")
+    return "\n" + "\n".join(lines)
+
+
 def log_route_event(event: str, payload: dict):
     try:
-        logger.info(
-            "%s %s",
+        logger.info(_format_route_summary(event, payload))
+        logger.debug(
+            "%s_full %s",
             event,
             json.dumps(payload, separators=(",", ":"), sort_keys=True),
         )
