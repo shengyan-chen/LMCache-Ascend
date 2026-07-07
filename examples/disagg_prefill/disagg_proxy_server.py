@@ -31,13 +31,21 @@ from lmcache.v1.storage_backend.pd_backend import (
 logger = init_logger(__name__)
 
 PREFILL_REQUEST_ALPHA = 256
+PD_TRANSFER_MODE_PUSH = "push"
+PD_TRANSFER_MODE_EAGER_PULL = "eager_pull"
+PD_TRANSFER_MODE_DELAY_PULL = "delay_pull"
+PD_BUFFER_ADMISSION_MODES = {
+    PD_TRANSFER_MODE_PUSH,
+    PD_TRANSFER_MODE_EAGER_PULL,
+}
 
 
 class WeightedSemaphore:
     """Async semaphore with variable-weight acquire.
 
     Limits in-flight PD token usage: each request holds ceil(L/chunk_size)
-    slots until decoding starts, preventing decoder buffer exhaustion deadlocks.
+    slots until decoding starts, preventing decoder buffer exhaustion deadlocks
+    in push and eager-pull modes.
     """
 
     def __init__(self, capacity: int) -> None:
@@ -172,10 +180,16 @@ async def lifespan(app: FastAPI):
         len(dec_hosts) == 1 and len(dec_ports) == 1 and global_args.num_decoders > 1
     )
 
-    kv_bytes_per_token = compute_kv_bytes_per_token(global_args.model)
-    pd_capacity_slots = global_args.pd_buffer_size // (
-        kv_bytes_per_token * global_args.chunk_size
+    pd_buffer_admission_enabled = (
+        global_args.pd_transfer_mode in PD_BUFFER_ADMISSION_MODES
     )
+    kv_bytes_per_token = None
+    pd_capacity_slots = None
+    if pd_buffer_admission_enabled:
+        kv_bytes_per_token = compute_kv_bytes_per_token(global_args.model)
+        pd_capacity_slots = global_args.pd_buffer_size // (
+            kv_bytes_per_token * global_args.chunk_size
+        )
 
     for i, (host, port) in enumerate(decoder_pairs):
         decoder_base_url = f"http://{host}:{int(port)}"
@@ -206,7 +220,12 @@ async def lifespan(app: FastAPI):
                 port=int(port),
                 init_port=init_ports,
                 alloc_port=alloc_ports,
-                pd_buffer_semaphore=WeightedSemaphore(pd_capacity_slots),
+                pd_buffer_semaphore=(
+                    WeightedSemaphore(pd_capacity_slots)
+                    if pd_capacity_slots is not None
+                    else None
+                ),
+                pd_transfer_mode=global_args.pd_transfer_mode,
             )
         )
 
@@ -214,15 +233,25 @@ async def lifespan(app: FastAPI):
 
     app.state.zmq_task = asyncio.create_task(zmq_pull_server())
 
-    logger.info(
-        "Per-decoder PD buffer semaphore: capacity=%d slots per decoder"
-        " (%d bytes / (%d bytes/tok * %d chunk_size)) for model %s.",
-        pd_capacity_slots,
-        global_args.pd_buffer_size,
-        kv_bytes_per_token,
-        global_args.chunk_size,
-        global_args.model,
-    )
+    if pd_buffer_admission_enabled:
+        logger.info(
+            "Per-decoder PD buffer semaphore: transfer_mode=%s capacity=%d"
+            " slots per decoder (%d bytes / (%d bytes/tok * %d chunk_size))"
+            " for model %s.",
+            global_args.pd_transfer_mode,
+            pd_capacity_slots,
+            global_args.pd_buffer_size,
+            kv_bytes_per_token,
+            global_args.chunk_size,
+            global_args.model,
+        )
+    else:
+        logger.info(
+            "Per-decoder PD buffer admission disabled for transfer_mode=%s;"
+            " --pd-buffer-size=%d is ignored by proxy admission control.",
+            global_args.pd_transfer_mode,
+            global_args.pd_buffer_size,
+        )
 
     yield
 
@@ -323,17 +352,36 @@ def parse_args():
     parser.add_argument("--proxy-host", type=str, default="localhost")
     parser.add_argument("--proxy-port", type=int, default=8500)
 
-    # PD buffer concurrency limiting. A weighted semaphore caps in-flight
-    # chunk slots to prevent decoder buffer exhaustion deadlocks.
+    # PD buffer concurrency limiting. In push and eager-pull modes, a weighted
+    # semaphore caps in-flight chunk slots to prevent decoder buffer exhaustion.
+    # Delay-pull mode does not pre-allocate the full decoder-side KV payload, so
+    # this buffer-size based admission control is disabled in that mode.
     # capacity_slots = pd_buffer_size // (kv_bytes_per_token * chunk_size)
     # kv_bytes_per_token is derived from the model config automatically.
+    parser.add_argument(
+        "--pd-transfer-mode",
+        type=str,
+        choices=[
+            PD_TRANSFER_MODE_PUSH,
+            PD_TRANSFER_MODE_EAGER_PULL,
+            PD_TRANSFER_MODE_DELAY_PULL,
+        ],
+        default=PD_TRANSFER_MODE_PUSH,
+        help=(
+            "PD transfer mode used by LMCache-Ascend. push and eager_pull"
+            " enable proxy-side PD buffer admission control; delay_pull uses"
+            " decoder load balancing only and ignores --pd-buffer-size for"
+            " proxy admission. Default: push."
+        ),
+    )
     parser.add_argument(
         "--model",
         type=str,
         default="meta-llama/Llama-3.1-8B-Instruct",
         help=(
             "HuggingFace model name or local path. Used to derive"
-            " kv_bytes_per_token for the PD buffer semaphore capacity."
+            " kv_bytes_per_token for the PD buffer semaphore capacity when"
+            " proxy-side PD buffer admission is enabled."
         ),
     )
     parser.add_argument(
@@ -342,8 +390,9 @@ def parse_args():
         default=2 * 1024 * 1024 * 1024,  # 2 GB
         help=(
             "PD transfer buffer size in bytes (must match the decoder's"
-            " LMCache config). Used to derive the in-flight slot capacity."
-            " Default: 2 GB."
+            " LMCache config). Used to derive the in-flight slot capacity in"
+            " push and eager_pull modes. Ignored by proxy admission control in"
+            " delay_pull mode. Default: 2 GB."
         ),
     )
     parser.add_argument(
@@ -416,7 +465,8 @@ class DecoderState:
     port: int
     init_port: list[int]
     alloc_port: list[int]
-    pd_buffer_semaphore: WeightedSemaphore
+    pd_buffer_semaphore: Optional[WeightedSemaphore] = None
+    pd_transfer_mode: str = PD_TRANSFER_MODE_PUSH
     active_decode_tokens: int = 0
     active_decode_requests: int = 0
     total_decode_tokens: int = 0
@@ -433,12 +483,15 @@ class DecoderState:
         return self.active_decode_tokens
 
     def snapshot(self) -> dict:
+        pd_buffer_admission_enabled = self.pd_buffer_semaphore is not None
         return {
             "name": self.name,
             "host": self.host,
             "port": self.port,
             "init_port": self.init_port,
             "alloc_port": self.alloc_port,
+            "pd_transfer_mode": self.pd_transfer_mode,
+            "pd_buffer_admission_enabled": pd_buffer_admission_enabled,
             "active_decode_tokens": self.active_decode_tokens,
             "active_decode_requests": self.active_decode_requests,
             "load_score": self.load_score,
@@ -448,8 +501,16 @@ class DecoderState:
             "last_error": self.last_error,
             "last_decode_ms": self.last_decode_ms,
             "decode_ms_ewma": self.decode_ms_ewma,
-            "pd_slots_available": self.pd_buffer_semaphore.available,
-            "pd_slots_capacity": self.pd_buffer_semaphore.capacity,
+            "pd_slots_available": (
+                self.pd_buffer_semaphore.available
+                if pd_buffer_admission_enabled
+                else None
+            ),
+            "pd_slots_capacity": (
+                self.pd_buffer_semaphore.capacity
+                if pd_buffer_admission_enabled
+                else None
+            ),
         }
 
 
@@ -615,6 +676,10 @@ async def select_decoder(
         return selected, {
             "decoder_policy": "min_active_decode_tokens",
             "decode_score": prompt_token_count,
+            "pd_transfer_mode": selected.pd_transfer_mode,
+            "pd_buffer_admission_enabled": (
+                selected.pd_buffer_semaphore is not None
+            ),
             "selected_decoder": selected.name,
             "selected_decoder_load_before": selected_load_before,
             "selected_decoder_state_after": selected.snapshot(),
@@ -771,6 +836,23 @@ def _format_decoder_active(state: dict) -> str:
     )
 
 
+def _format_pd_slots(state: dict) -> str:
+    if not state:
+        return "-"
+    if not state.get("pd_buffer_admission_enabled", False):
+        return "disabled"
+    return (
+        f"{state.get('pd_slots_available', '-')}/"
+        f"{state.get('pd_slots_capacity', '-')}"
+    )
+
+
+def _format_pd_buffer_admission(value) -> str:
+    if value is None:
+        return "-"
+    return "enabled" if value else "disabled"
+
+
 def _format_decoder_candidate(state: dict) -> str:
     name = state.get("name", "-")
     host = state.get("host", "-")
@@ -779,8 +861,7 @@ def _format_decoder_candidate(state: dict) -> str:
         f"{name}@{host}:{port}"
         f"(load={state.get('load_score', '-')},"
         f"active={_format_decoder_active(state)},"
-        f"pd_slots={state.get('pd_slots_available', '-')}/"
-        f"{state.get('pd_slots_capacity', '-')},"
+        f"pd_slots={_format_pd_slots(state)},"
         f"total={state.get('total_decode_requests', '-')}req/"
         f"{state.get('total_decode_tokens', '-')}tok,"
         f"failed={state.get('failed_decode_requests', '-')},"
@@ -814,6 +895,9 @@ def _format_route_summary(event: str, payload: dict) -> str:
         f" - chosen_decoder: {payload.get('chosen_decoder', '-')}",
         f" - prompt_token_count: {payload.get('prompt_token_count', '-')}",
         f" - prefill_ms: {_format_metric(payload.get('prefill_ms'))}",
+        f" - pd_transfer_mode: {payload.get('pd_transfer_mode', '-')}",
+        " - pd_buffer_admission: "
+        f"{_format_pd_buffer_admission(payload.get('pd_buffer_admission_enabled'))}",
         f" - pd_slot_count: {payload.get('pd_slot_count', '-')}",
         f" - pd_slot_wait_ms: {_format_metric(payload.get('pd_slot_wait_ms'))}",
         " - prefiller_load_before: "
@@ -872,6 +956,31 @@ async def wait_decode_kv_ready(req_id: str, num_tp_rank: int):
     app.state.finished_reqs.pop(req_id)
 
 
+async def acquire_pd_buffer_slots(
+    decoder_state: DecoderState,
+    prompt_token_count: int,
+) -> tuple[int, float, bool]:
+    """Acquire decoder PD buffer slots when mode-aware admission is enabled."""
+    if decoder_state.pd_buffer_semaphore is None:
+        return 0, 0.0, False
+
+    slots = math.ceil(prompt_token_count / global_args.chunk_size)
+    pd_slot_wait_start = time.time()
+    await decoder_state.pd_buffer_semaphore.acquire(slots)
+    pd_slot_wait_ms = (time.time() - pd_slot_wait_start) * 1000
+    return slots, pd_slot_wait_ms, True
+
+
+async def release_pd_buffer_slots(
+    decoder_state: DecoderState,
+    slots: int,
+) -> None:
+    """Release decoder PD buffer slots if mode-aware admission is enabled."""
+    if decoder_state.pd_buffer_semaphore is None:
+        return
+    await decoder_state.pd_buffer_semaphore.release(slots)
+
+
 @app.post("/v1/completions")
 async def handle_completions(request: Request):
     global counter, stats_calculator
@@ -925,13 +1034,12 @@ async def handle_completions(request: Request):
         req_data["prompt"] = tokenize_output["tokens"]
         req_data["max_tokens"] = 1
 
-        # Acquire ceil(L/chunk_size) PD buffer slots before prefill.
-        slots = math.ceil(prompt_token_count / global_args.chunk_size)
-        pd_slot_wait_ms = 0.0
-        pd_slot_wait_start = time.time()
-        await decoder_state.pd_buffer_semaphore.acquire(slots)
-        pd_slot_wait_ms = (time.time() - pd_slot_wait_start) * 1000
-        acquired = True
+        # Acquire decoder PD buffer slots before prefill when mode-aware
+        # admission is enabled. Delay-pull mode skips buffer-size admission.
+        slots, pd_slot_wait_ms, acquired = await acquire_pd_buffer_slots(
+            decoder_state,
+            prompt_token_count,
+        )
 
         disagg_spec = {
             "req_id": req_id,
@@ -1019,7 +1127,7 @@ async def handle_completions(request: Request):
                 await wait_decode_kv_ready(req_id, num_tp_rank)
                 kv_ready_wait_ms = (time.time() - kv_ready_wait_start) * 1000
                 if acquired:
-                    await decoder_state.pd_buffer_semaphore.release(slots)
+                    await release_pd_buffer_slots(decoder_state, slots)
                     pd_slots_released = True
 
                 decode_stream_start = time.time()
@@ -1033,7 +1141,7 @@ async def handle_completions(request: Request):
                 raise
             finally:
                 if acquired and not pd_slots_released:
-                    await decoder_state.pd_buffer_semaphore.release(slots)
+                    await release_pd_buffer_slots(decoder_state, slots)
                     pd_slots_released = True
                 decoder_release_state = None
                 if decoder_state is not None and not decoder_released:
@@ -1078,7 +1186,7 @@ async def handle_completions(request: Request):
             route_info["decoder_state_after_release"] = release_state
             decoder_released = True
         if decoder_state is not None and acquired and not pd_slots_released:
-            await decoder_state.pd_buffer_semaphore.release(slots)
+            await release_pd_buffer_slots(decoder_state, slots)
             pd_slots_released = True
         if route_info:
             error_payload = dict(route_info)
@@ -1160,13 +1268,12 @@ async def handle_chat_completions(request: Request):
             org_max_completion_tokens = req_data["max_completion_tokens"]
             req_data["max_completion_tokens"] = 1
 
-        # Acquire ceil(L/chunk_size) PD buffer slots before prefill.
-        slots = math.ceil(prompt_token_count / global_args.chunk_size)
-        pd_slot_wait_ms = 0.0
-        pd_slot_wait_start = time.time()
-        await decoder_state.pd_buffer_semaphore.acquire(slots)
-        pd_slot_wait_ms = (time.time() - pd_slot_wait_start) * 1000
-        acquired = True
+        # Acquire decoder PD buffer slots before prefill when mode-aware
+        # admission is enabled. Delay-pull mode skips buffer-size admission.
+        slots, pd_slot_wait_ms, acquired = await acquire_pd_buffer_slots(
+            decoder_state,
+            prompt_token_count,
+        )
 
         disagg_spec = {
             "req_id": req_id,
@@ -1278,7 +1385,7 @@ async def handle_chat_completions(request: Request):
                 await wait_decode_kv_ready(req_id, num_tp_rank)
                 kv_ready_wait_ms = (time.time() - kv_ready_wait_start) * 1000
                 if acquired:
-                    await decoder_state.pd_buffer_semaphore.release(slots)
+                    await release_pd_buffer_slots(decoder_state, slots)
                     pd_slots_released = True
 
                 decode_stream_start = time.time()
@@ -1334,7 +1441,7 @@ async def handle_chat_completions(request: Request):
                 raise
             finally:
                 if acquired and not pd_slots_released:
-                    await decoder_state.pd_buffer_semaphore.release(slots)
+                    await release_pd_buffer_slots(decoder_state, slots)
                     pd_slots_released = True
                 decoder_release_state = None
                 if decoder_state is not None and not decoder_released:
@@ -1379,7 +1486,7 @@ async def handle_chat_completions(request: Request):
             route_info["decoder_state_after_release"] = release_state
             decoder_released = True
         if decoder_state is not None and acquired and not pd_slots_released:
-            await decoder_state.pd_buffer_semaphore.release(slots)
+            await release_pd_buffer_slots(decoder_state, slots)
             pd_slots_released = True
         if route_info:
             error_payload = dict(route_info)
