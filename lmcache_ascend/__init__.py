@@ -179,6 +179,17 @@ def _patch_config():
         "This config is only used when pd_pull_mode is set to True.",
     }
 
+    # Add pd_handoff_lease_ttl config
+    lmcache.v1.config._CONFIG_DEFINITIONS["pd_handoff_lease_ttl"] = {
+        "type": float,
+        "default": 300.0,
+        "env_converter": float,
+        "description": "TTL in seconds for receiver-side PD pull handoff leases. "
+        "The lease protects PullReady hits until the decoder lookup claims them. "
+        "Expired, unclaimed handoffs are released to avoid leaked KV entries. "
+        "Keep this lower than pd_pull_pending_ttl on the sender.",
+    }
+
     # Add pd_pull_backpressure_reserve_pct config
     lmcache.v1.config._CONFIG_DEFINITIONS["pd_pull_backpressure_reserve_pct"] = {
         "type": float,

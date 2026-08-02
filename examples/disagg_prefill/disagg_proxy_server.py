@@ -11,6 +11,7 @@ import json
 import math
 import os
 import time
+import uuid
 
 # Third Party
 from fastapi import FastAPI, Request
@@ -985,7 +986,9 @@ async def release_pd_buffer_slots(
 async def handle_completions(request: Request):
     global counter, stats_calculator
     counter += 1
-    req_id = str(counter)  # we use counter as req_id
+    # This ID crosses proxy -> prefiller -> decoder and names the temporary
+    # receiver handoff lease.  It must not collide after a proxy restart.
+    req_id = uuid.uuid4().hex
 
     st = time.time()
     slots = 0  # slots to release on error; set after successful acquire only
@@ -1086,7 +1089,9 @@ async def handle_completions(request: Request):
 
         req_data["max_tokens"] = org_max_tokens - 1
         req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
-        req_data.pop("kv_transfer_params")
+        req_data["kv_transfer_params"] = {
+            "lmcache.pd_handoff_id": req_id,
+        }
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options
@@ -1213,7 +1218,7 @@ async def handle_completions(request: Request):
 async def handle_chat_completions(request: Request):
     global counter, stats_calculator
     counter += 1
-    req_id = str(counter)
+    req_id = uuid.uuid4().hex
 
     st = time.time()
     slots = 0  # slots to release on error; set after successful acquire only
@@ -1326,7 +1331,9 @@ async def handle_chat_completions(request: Request):
         # Add the first token from prefill to the tokenized messages for decode
         req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
 
-        req_data.pop("kv_transfer_params")
+        req_data["kv_transfer_params"] = {
+            "lmcache.pd_handoff_id": req_id,
+        }
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options

@@ -435,6 +435,10 @@ class AscendPDSenderMixin:
         keeps un-acked MemObjs pinned until a ``PullDoneSignal`` arrives
         (handled in ``_pull_done_listener_loop``).
         """
+        handoff_id = getattr(transfer_spec, "req_id", None)
+        if not handoff_id:
+            raise ValueError("PD pull transfer_spec.req_id must not be empty")
+
         # Backpressure: block if too many pages are already pinned.
         # The daemon thread (_pull_done_listener_loop) drains entries
         # concurrently, so this will eventually unblock.
@@ -475,6 +479,7 @@ class AscendPDSenderMixin:
 
         pull_notif = PullReadyNotif(
             pull_id=pull_id,
+            handoff_id=str(handoff_id),
             keys=[k.to_string() for k in keys],
             sender_buffer_uuids=sender_buffer_uuids,
             sender_mem_indexes=sender_mem_indexes,
@@ -508,6 +513,10 @@ class AscendPDSenderMixin:
                 len(memory_objs),
             )
             release_memory_objects(memory_objs)
+            # A receiver-side rollback may send Done before the failed ack is
+            # processed.  This pull will never be registered as pending.
+            with self._pull_pending_lock:
+                self._early_pull_done.discard(pull_id)
             with self._peer_alloc_backoff_lock:
                 self._peer_alloc_backoff[receiver_id] = (
                     time.monotonic() + self._peer_alloc_backoff_ttl
