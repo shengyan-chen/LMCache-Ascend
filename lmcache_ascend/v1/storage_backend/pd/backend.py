@@ -11,6 +11,7 @@ allocation, and key lookup/partitioning.
 from dataclasses import dataclass, field
 from typing import Optional, Union
 import threading
+import time
 
 # Third Party
 from lmcache.integration.vllm.utils import get_size_bytes
@@ -493,20 +494,48 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
         request_id: str,
     ) -> int:
         hit_chunks = 0
+        stop_reason = "complete"
+        stop_index = -1
+        stop_key = "-"
+        stop_key_hash = "-"
         with self.data_lock:
-            for key in keys:
+            for idx, key in enumerate(keys):
                 entry = self._pd_entries.get(key)
                 if entry is None:
+                    stop_reason = "missing"
+                    stop_index = idx
+                    stop_key = key.to_string()
+                    stop_key_hash = key.chunk_hash_hex
                     break
 
                 base_obj = entry.base_obj
                 if isinstance(base_obj, ProxyMemoryObj) and base_obj.consumed:
+                    stop_reason = "consumed"
+                    stop_index = idx
+                    stop_key = key.to_string()
+                    stop_key_hash = key.chunk_hash_hex
                     self._delete_pd_entry_locked(key, entry, release_obj=False)
                     break
 
                 self._ensure_request_lease_locked(key, entry, request_id)
 
                 hit_chunks += 1
+
+        if hit_chunks != len(keys):
+            logger.warning(
+                "PD_LIFETIME_DIAG event=lookup_short_hit rank=%s request=%s "
+                "requested=%d hit=%d stop_reason=%s stop_index=%d "
+                "stop_key=%s stop_key_hash=%s mono_ns=%d",
+                self.tp_rank,
+                request_id,
+                len(keys),
+                hit_chunks,
+                stop_reason,
+                stop_index,
+                stop_key,
+                stop_key_hash,
+                time.monotonic_ns(),
+            )
         return hit_chunks
 
     def _ensure_request_lease_locked(
@@ -537,21 +566,32 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
 
     def release_request_lease(self, request_id: str) -> None:
         proxy_contexts = []
+        deleted_count = 0
+        retained_count = 0
+        missing_count = 0
+        deleted_key_hashes: list[str] = []
+        context_ids: set[str] = set()
         with self.data_lock:
             keys = self._pd_request_keys.pop(request_id, set())
             for key in list(keys):
                 entry = self._pd_entries.get(key)
                 if entry is None:
+                    missing_count += 1
                     continue
 
                 entry.owners.discard(request_id)
                 proxy = entry.proxy_leases.pop(request_id, None)
                 if proxy is not None:
                     proxy_contexts.append(proxy.transfer_context)
+                    context_ids.add(hex(id(proxy.transfer_context)))
 
                 entry.pending_delete = True
                 if not entry.owners:
+                    deleted_key_hashes.append(key.chunk_hash_hex)
                     self._delete_pd_entry_locked(key, entry, release_obj=True)
+                    deleted_count += 1
+                else:
+                    retained_count += 1
 
         for transfer_context in proxy_contexts:
             release_request = getattr(
@@ -561,6 +601,33 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
             )
             if callable(release_request):
                 release_request(request_id)
+
+        if keys:
+            done_contexts = tuple(
+                sorted(
+                    {
+                        hex(id(context))
+                        for context in proxy_contexts
+                        if getattr(context, "_done_sent", False)
+                    }
+                )
+            )
+            logger.info(
+                "PD_LIFETIME_DIAG event=request_release rank=%s request=%s "
+                "leased_keys=%d deleted=%d retained=%d missing=%d "
+                "deleted_key_hashes=%s contexts=%s done_contexts=%s "
+                "mono_ns=%d",
+                self.tp_rank,
+                request_id,
+                len(keys),
+                deleted_count,
+                retained_count,
+                missing_count,
+                tuple(deleted_key_hashes),
+                tuple(sorted(context_ids)),
+                done_contexts,
+                time.monotonic_ns(),
+            )
 
     def remove(
         self,

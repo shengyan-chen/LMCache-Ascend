@@ -278,6 +278,58 @@ class AscendPDReceiverMixin:
             msg.keys
         )
 
+        if already_sent_indexes:
+            first_already_index = already_sent_indexes[0]
+            first_already_key = CacheEngineKey.from_string(
+                msg.keys[first_already_index]
+            )
+            entry_present = False
+            owners: tuple[str, ...] = ()
+            pending_delete = False
+            context_id = "-"
+            context_done = False
+            active_leases = -1
+            with self.data_lock:
+                entry = self._pd_entries.get(first_already_key)
+                if entry is not None:
+                    entry_present = True
+                    owners = tuple(sorted(entry.owners))
+                    pending_delete = entry.pending_delete
+                    if isinstance(entry.base_obj, ProxyMemoryObj):
+                        transfer_context = entry.base_obj.transfer_context
+                        context_id = hex(id(transfer_context))
+                        context_done = getattr(
+                            transfer_context, "_done_sent", False
+                        )
+                        active_leases = getattr(
+                            transfer_context, "_active_lease_count", -1
+                        )
+
+            logger.info(
+                "PD_LIFETIME_DIAG event=pull_ready_already_sent "
+                "rank=%s pull_id=%s sender=%s total=%d already=%d new=%d "
+                "first_already_index=%d first_already_key=%s "
+                "first_already_key_hash=%s "
+                "entry_present=%s owners=%s pending_delete=%s context=%s "
+                "context_done=%s active_leases=%d mono_ns=%d",
+                self.tp_rank,
+                msg.pull_id,
+                sender_id,
+                len(msg.keys),
+                len(already_sent_indexes),
+                len(new_indexes),
+                first_already_index,
+                first_already_key.to_string(),
+                first_already_key.chunk_hash_hex,
+                entry_present,
+                owners,
+                pending_delete,
+                context_id,
+                context_done,
+                active_leases,
+                time.monotonic_ns(),
+            )
+
         num_proxies = len(new_indexes)
 
         if num_proxies > 0:
