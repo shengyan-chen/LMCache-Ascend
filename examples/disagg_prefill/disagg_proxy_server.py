@@ -1139,6 +1139,31 @@ async def handle_completions(request: Request):
                 async for chunk in stream_service_response(
                     decode_client.client, "/v1/completions", req_data
                 ):
+                    chunk_str = chunk.decode("utf-8")
+                    if chunk_str.startswith("data: ") and not chunk_str.startswith(
+                        "data: [DONE]"
+                    ):
+                        try:
+                            json_str = chunk_str[6:].strip()
+                            if json_str:
+                                completion_data = json.loads(json_str)
+                                usage = completion_data.get("usage")
+                                if usage is not None:
+                                    completion_tokens = usage.get("completion_tokens")
+                                    total_tokens = usage.get("total_tokens")
+                                    if completion_tokens is not None:
+                                        usage["completion_tokens"] = completion_tokens + 1
+                                    if total_tokens is not None:
+                                        usage["total_tokens"] = total_tokens + 1
+                                    chunk = (
+                                        "data: "
+                                        + json.dumps(
+                                            completion_data, separators=(",", ":")
+                                        )
+                                        + "\n\n"
+                                    ).encode()
+                        except (json.JSONDecodeError, KeyError, TypeError):
+                            pass
                     yield chunk
                 decode_stream_ms = (time.time() - decode_stream_start) * 1000
             except BaseException as exc:
@@ -1408,6 +1433,35 @@ async def handle_chat_completions(request: Request):
                             json_str = chunk_str[6:].strip()  # Remove 'data: ' prefix
                             if json_str:
                                 completion_data = json.loads(json_str)
+                                choices = completion_data.get("choices") or []
+                                if not choices:
+                                    usage = completion_data.get("usage")
+                                    if usage is not None:
+                                        completion_tokens = usage.get(
+                                            "completion_tokens"
+                                        )
+                                        total_tokens = usage.get("total_tokens")
+                                        if completion_tokens is not None:
+                                            usage["completion_tokens"] = (
+                                                completion_tokens + 1
+                                            )
+                                        if total_tokens is not None:
+                                            usage["total_tokens"] = total_tokens + 1
+                                        completion_data["object"] = (
+                                            "chat.completion.chunk"
+                                        )
+                                        converted_chunk = (
+                                            "data: "
+                                            + json.dumps(
+                                                completion_data, separators=(",", ":")
+                                            )
+                                            + "\n\n"
+                                        ).encode()
+                                        yield converted_chunk
+                                    else:
+                                        yield chunk
+                                    continue
+                                choice = choices[0]
                                 chat_completion_data = {
                                     "id": completion_data["id"],
                                     "object": "chat.completion.chunk",
@@ -1417,16 +1471,12 @@ async def handle_chat_completions(request: Request):
                                         {
                                             "index": 0,
                                             "delta": {
-                                                "content": completion_data["choices"][
-                                                    0
-                                                ]["text"]
+                                                "content": choice["text"]
                                             },
-                                            "logprobs": completion_data["choices"][
-                                                0
-                                            ].get("logprobs"),
-                                            "finish_reason": completion_data[
-                                                "choices"
-                                            ][0].get("finish_reason"),
+                                            "logprobs": choice.get("logprobs"),
+                                            "finish_reason": choice.get(
+                                                "finish_reason"
+                                            ),
                                         }
                                     ],
                                 }
@@ -1438,7 +1488,7 @@ async def handle_chat_completions(request: Request):
                                     + "\n\n"
                                 ).encode()
                                 yield converted_chunk
-                        except (json.JSONDecodeError, KeyError):
+                        except (json.JSONDecodeError, KeyError, TypeError):
                             yield chunk
                     else:
                         yield chunk
