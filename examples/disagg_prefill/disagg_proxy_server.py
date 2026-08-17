@@ -14,7 +14,7 @@ import time
 import uuid
 
 # Third Party
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 import httpx
 import msgspec
@@ -29,7 +29,7 @@ from lmcache.v1.storage_backend.pd_backend import (
     ProxyNotif,
 )
 
-from disagg_proxy_request import InvalidTokenBudget, build_phase_requests
+from disagg_proxy_request import build_phase_requests
 
 logger = init_logger(__name__)
 
@@ -1264,14 +1264,11 @@ async def handle_chat_completions(request: Request):
         )
         tokenize_output = tokenize_output.json()
         prompt_token_count = len(tokenize_output["tokens"])
-        try:
-            prefill_req_data, decode_req_data = build_phase_requests(
-                req_data,
-                tokenize_output["tokens"],
-                is_chat=True,
-            )
-        except InvalidTokenBudget as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        prefill_req_data, decode_req_data = build_phase_requests(
+            req_data,
+            tokenize_output["tokens"],
+            is_chat=True,
+        )
 
         decoder_state, decoder_info = await select_decoder(prompt_token_count)
         route_info = dict(decoder_info)

@@ -10,10 +10,7 @@ import pytest
 EXAMPLE_DIR = Path(__file__).parents[2] / "examples" / "disagg_prefill"
 sys.path.insert(0, str(EXAMPLE_DIR))
 
-from disagg_proxy_request import (  # noqa: E402
-    InvalidTokenBudget,
-    build_phase_requests,
-)
+from disagg_proxy_request import build_phase_requests  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -58,13 +55,15 @@ def test_chat_budget_is_normalized_for_internal_completion_requests(
     assert decode_request["prompt"] == [10, 20, 30, 40]
 
 
-def test_chat_without_token_budget_is_rejected():
-    with pytest.raises(InvalidTokenBudget, match="max_completion_tokens.*max_tokens"):
-        build_phase_requests(
-            {"messages": [{"role": "user", "content": "hello"}]},
-            [10, 20],
-            is_chat=True,
-        )
+def test_chat_without_token_budget_uses_backend_default_for_decode():
+    prefill_request, decode_request = build_phase_requests(
+        {"messages": [{"role": "user", "content": "hello"}]},
+        [10, 20],
+        is_chat=True,
+    )
+
+    assert prefill_request["max_tokens"] == 1
+    assert decode_request["max_tokens"] is None
 
 
 def test_completion_without_max_tokens_uses_vllm_default():
