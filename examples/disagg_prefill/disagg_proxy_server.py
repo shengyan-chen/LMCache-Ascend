@@ -14,7 +14,7 @@ import time
 import uuid
 
 # Third Party
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 import httpx
 import msgspec
@@ -28,6 +28,8 @@ from lmcache.v1.storage_backend.pd_backend import (
     PDMsg,
     ProxyNotif,
 )
+
+from disagg_proxy_request import InvalidTokenBudget, build_phase_requests
 
 logger = init_logger(__name__)
 
@@ -1010,6 +1012,11 @@ async def handle_completions(request: Request):
         )
         tokenize_output = tokenize_output.json()
         prompt_token_count = len(tokenize_output["tokens"])
+        prefill_req_data, decode_req_data = build_phase_requests(
+            req_data,
+            tokenize_output["tokens"],
+            is_chat=False,
+        )
 
         decoder_state, decoder_info = await select_decoder(prompt_token_count)
         route_info = dict(decoder_info)
@@ -1033,10 +1040,6 @@ async def handle_completions(request: Request):
         )
         log_route_event("proxy_route_selected", route_info)
 
-        org_max_tokens = req_data["max_tokens"]
-        req_data["prompt"] = tokenize_output["tokens"]
-        req_data["max_tokens"] = 1
-
         # Acquire decoder PD buffer slots before prefill when mode-aware
         # admission is enabled. Delay-pull mode skips buffer-size admission.
         slots, pd_slot_wait_ms, acquired = await acquire_pd_buffer_slots(
@@ -1052,18 +1055,15 @@ async def handle_completions(request: Request):
         }
         num_tp_rank = len(decode_client.init_port or [])
 
-        req_data["kv_transfer_params"] = {
+        prefill_req_data["kv_transfer_params"] = {
             "ret_first_tok": True,
             "disagg_spec": disagg_spec,
         }
 
-        req_data["stream"] = False
-        stream_options = req_data.pop("stream_options", None)
-
         # Send request to prefill service, ignore the response
         prefill_start = time.time()
         prefill_output = await send_request_to_service(
-            prefill_client.client, "/v1/completions", req_data
+            prefill_client.client, "/v1/completions", prefill_req_data
         )
         prefill_ms = (time.time() - prefill_start) * 1000
         prefiller_release_state = await release_prefiller(
@@ -1087,14 +1087,12 @@ async def handle_completions(request: Request):
         et = time.time()
         stats_calculator.add(et - st)
 
-        req_data["max_tokens"] = org_max_tokens - 1
-        req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
-        req_data["kv_transfer_params"] = {
+        decode_req_data["prompt"].append(
+            prefill_output["kv_transfer_params"]["first_tok"]
+        )
+        decode_req_data["kv_transfer_params"] = {
             "lmcache.pd_handoff_id": req_id,
         }
-        req_data["stream"] = True
-        if stream_options is not None:
-            req_data["stream_options"] = stream_options
 
         route_log_base = dict(route_info)
         log_route_event("proxy_route_prefill_done", route_log_base)
@@ -1137,7 +1135,7 @@ async def handle_completions(request: Request):
 
                 decode_stream_start = time.time()
                 async for chunk in stream_service_response(
-                    decode_client.client, "/v1/completions", req_data
+                    decode_client.client, "/v1/completions", decode_req_data
                 ):
                     chunk_str = chunk.decode("utf-8")
                     if chunk_str.startswith("data: ") and not chunk_str.startswith(
@@ -1266,6 +1264,14 @@ async def handle_chat_completions(request: Request):
         )
         tokenize_output = tokenize_output.json()
         prompt_token_count = len(tokenize_output["tokens"])
+        try:
+            prefill_req_data, decode_req_data = build_phase_requests(
+                req_data,
+                tokenize_output["tokens"],
+                is_chat=True,
+            )
+        except InvalidTokenBudget as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         decoder_state, decoder_info = await select_decoder(prompt_token_count)
         route_info = dict(decoder_info)
@@ -1289,15 +1295,6 @@ async def handle_chat_completions(request: Request):
         )
         log_route_event("proxy_route_selected", route_info)
 
-        org_max_tokens = req_data["max_tokens"]
-        req_data["prompt"] = tokenize_output["tokens"]
-        req_data["max_tokens"] = 1
-
-        org_max_completion_tokens = None
-        if "max_completion_tokens" in req_data:
-            org_max_completion_tokens = req_data["max_completion_tokens"]
-            req_data["max_completion_tokens"] = 1
-
         # Acquire decoder PD buffer slots before prefill when mode-aware
         # admission is enabled. Delay-pull mode skips buffer-size admission.
         slots, pd_slot_wait_ms, acquired = await acquire_pd_buffer_slots(
@@ -1314,18 +1311,15 @@ async def handle_chat_completions(request: Request):
 
         num_tp_rank = len(decode_client.init_port or [])
 
-        req_data["kv_transfer_params"] = {
+        prefill_req_data["kv_transfer_params"] = {
             "ret_first_tok": True,
             "disagg_spec": disagg_spec,
         }
 
-        req_data["stream"] = False
-        stream_options = req_data.pop("stream_options", None)
-
         # Send request to prefill service, get the response
         prefill_start = time.time()
         prefill_output = await send_request_to_service(
-            prefill_client.client, "/v1/completions", req_data
+            prefill_client.client, "/v1/completions", prefill_req_data
         )
         prefill_ms = (time.time() - prefill_start) * 1000
         prefiller_release_state = await release_prefiller(
@@ -1349,19 +1343,14 @@ async def handle_chat_completions(request: Request):
         et = time.time()
         stats_calculator.add(et - st)
 
-        req_data["max_tokens"] = org_max_tokens - 1
-        if org_max_completion_tokens is not None:
-            req_data["max_completion_tokens"] = org_max_completion_tokens - 1
-
         # Add the first token from prefill to the tokenized messages for decode
-        req_data["prompt"].append(prefill_output["kv_transfer_params"]["first_tok"])
+        decode_req_data["prompt"].append(
+            prefill_output["kv_transfer_params"]["first_tok"]
+        )
 
-        req_data["kv_transfer_params"] = {
+        decode_req_data["kv_transfer_params"] = {
             "lmcache.pd_handoff_id": req_id,
         }
-        req_data["stream"] = True
-        if stream_options is not None:
-            req_data["stream_options"] = stream_options
 
         route_log_base = dict(route_info)
         log_route_event("proxy_route_prefill_done", route_log_base)
@@ -1423,7 +1412,7 @@ async def handle_chat_completions(request: Request):
                 decode_stream_start = time.time()
                 # Stream and convert completion format chunks to chat completion format
                 async for chunk in stream_service_response(
-                    decode_client.client, "/v1/completions", req_data
+                    decode_client.client, "/v1/completions", decode_req_data
                 ):
                     chunk_str = chunk.decode("utf-8")
                     if chunk_str.startswith("data: ") and not chunk_str.startswith(
