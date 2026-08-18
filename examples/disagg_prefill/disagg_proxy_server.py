@@ -29,7 +29,7 @@ from lmcache.v1.storage_backend.pd_backend import (
     ProxyNotif,
 )
 
-from disagg_proxy_request import build_phase_requests
+from disagg_proxy_request import build_phase_requests, parse_chat_render_output
 
 logger = init_logger(__name__)
 
@@ -1256,18 +1256,24 @@ async def handle_chat_completions(request: Request):
     try:
         req_data = await request.json()
 
-        tokenization_client = pick_up_tokenization_client(request)
-
-        # For chat completions, we need to tokenize the messages
-        tokenize_output = await send_request_to_service(
-            tokenization_client.client, "/tokenize", {"messages": req_data["messages"]}
+        render_client = round_robin_pick_client(
+            app.state.prefill_clients, next(tokenization_round_robin_counter)
         )
-        tokenize_output = tokenize_output.json()
-        prompt_token_count = len(tokenize_output["tokens"])
+
+        # Render with vLLM's authoritative chat preprocessing so omitted token
+        # limits resolve exactly as they do on the mixed-serving chat endpoint.
+        render_output = await send_request_to_service(
+            render_client.client, "/v1/chat/completions/render", req_data
+        )
+        prompt_token_ids, resolved_max_tokens = parse_chat_render_output(
+            render_output.json()
+        )
+        prompt_token_count = len(prompt_token_ids)
         prefill_req_data, decode_req_data = build_phase_requests(
             req_data,
-            tokenize_output["tokens"],
+            prompt_token_ids,
             is_chat=True,
+            resolved_max_tokens=resolved_max_tokens,
         )
 
         decoder_state, decoder_info = await select_decoder(prompt_token_count)
@@ -1278,7 +1284,8 @@ async def handle_chat_completions(request: Request):
                 "endpoint": "/v1/chat/completions",
                 "prompt_token_count": prompt_token_count,
                 "chosen_decoder": decoder_state.name,
-                "tokenization_client": tokenization_client.name,
+                "render_client": render_client.name,
+                "resolved_max_tokens": resolved_max_tokens,
             }
         )
         decode_client = decoder_state.client_info

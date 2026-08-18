@@ -10,19 +10,22 @@ import pytest
 EXAMPLE_DIR = Path(__file__).parents[2] / "examples" / "disagg_prefill"
 sys.path.insert(0, str(EXAMPLE_DIR))
 
-from disagg_proxy_request import build_phase_requests  # noqa: E402
+import disagg_proxy_request as request_helpers  # noqa: E402
+
+
+build_phase_requests = request_helpers.build_phase_requests
 
 
 @pytest.mark.parametrize(
-    ("request_data", "expected_decode_tokens"),
+    ("request_data", "resolved_max_tokens", "expected_decode_tokens"),
     [
-        ({"max_completion_tokens": 150}, 149),
-        ({"max_tokens": 120}, 119),
-        ({"max_tokens": 120, "max_completion_tokens": 150}, 149),
+        ({"max_completion_tokens": 150}, 140, 139),
+        ({"max_tokens": 120}, 110, 109),
+        ({"max_tokens": 120, "max_completion_tokens": 150}, 140, 139),
     ],
 )
 def test_chat_budget_is_normalized_for_internal_completion_requests(
-    request_data, expected_decode_tokens
+    request_data, resolved_max_tokens, expected_decode_tokens
 ):
     request_data.update(
         {
@@ -35,7 +38,10 @@ def test_chat_budget_is_normalized_for_internal_completion_requests(
     original = deepcopy(request_data)
 
     prefill_request, decode_request = build_phase_requests(
-        request_data, [10, 20, 30], is_chat=True
+        request_data,
+        [10, 20, 30],
+        is_chat=True,
+        resolved_max_tokens=resolved_max_tokens,
     )
 
     assert request_data == original
@@ -55,15 +61,28 @@ def test_chat_budget_is_normalized_for_internal_completion_requests(
     assert decode_request["prompt"] == [10, 20, 30, 40]
 
 
-def test_chat_without_token_budget_uses_backend_default_for_decode():
+def test_chat_without_token_budget_uses_rendered_context_limit():
     prefill_request, decode_request = build_phase_requests(
         {"messages": [{"role": "user", "content": "hello"}]},
         [10, 20],
         is_chat=True,
+        resolved_max_tokens=196569,
     )
 
     assert prefill_request["max_tokens"] == 1
-    assert decode_request["max_tokens"] is None
+    assert decode_request["max_tokens"] == 196568
+
+
+def test_parse_chat_render_output_returns_tokens_and_effective_budget():
+    prompt_token_ids, resolved_max_tokens = request_helpers.parse_chat_render_output(
+        {
+            "token_ids": [10, 20, 30],
+            "sampling_params": {"max_tokens": 196569, "temperature": 1.0},
+        }
+    )
+
+    assert prompt_token_ids == [10, 20, 30]
+    assert resolved_max_tokens == 196569
 
 
 def test_completion_without_max_tokens_uses_vllm_default():
