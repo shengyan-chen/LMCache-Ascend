@@ -37,6 +37,17 @@ def upstream_service_error_from_response(response: Any) -> UpstreamServiceError:
     )
 
 
+def normalize_chat_request(request_data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize semantically empty tool configuration for vLLM chat APIs."""
+    normalized = request_data.copy()
+    if normalized.get("tools") == [] and normalized.get("tool_choice") in (
+        None,
+        "none",
+    ):
+        normalized.pop("tools")
+    return normalized
+
+
 def parse_chat_render_output(
     render_output: dict[str, Any],
 ) -> tuple[list[int], int]:

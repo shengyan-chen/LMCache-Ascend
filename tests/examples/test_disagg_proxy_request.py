@@ -18,6 +18,41 @@ build_phase_requests = request_helpers.build_phase_requests
 
 
 @pytest.mark.parametrize(
+    "request_data",
+    [
+        {"tools": []},
+        {"tools": [], "tool_choice": None},
+        {"tools": [], "tool_choice": "none"},
+    ],
+)
+def test_normalize_chat_request_removes_semantically_empty_tools(request_data):
+    request_data.update(
+        {
+            "model": "MiniMax-M2.7",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    )
+    original = deepcopy(request_data)
+
+    normalized = request_helpers.normalize_chat_request(request_data)
+
+    assert "tools" not in normalized
+    assert request_data == original
+
+
+@pytest.mark.parametrize("tool_choice", ["auto", "required", {"type": "function"}])
+def test_normalize_chat_request_preserves_invalid_tool_choice_for_validation(
+    tool_choice,
+):
+    request_data = {"tools": [], "tool_choice": tool_choice}
+
+    normalized = request_helpers.normalize_chat_request(request_data)
+
+    assert normalized == request_data
+    assert normalized is not request_data
+
+
+@pytest.mark.parametrize(
     ("request_data", "resolved_max_tokens", "expected_decode_tokens"),
     [
         ({"max_completion_tokens": 150}, 140, 139),

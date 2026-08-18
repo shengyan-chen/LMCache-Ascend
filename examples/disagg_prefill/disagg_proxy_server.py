@@ -32,6 +32,7 @@ from lmcache.v1.storage_backend.pd_backend import (
 from disagg_proxy_request import (
     UpstreamServiceError,
     build_phase_requests,
+    normalize_chat_request,
     parse_chat_render_output,
     upstream_service_error_from_response,
 )
@@ -1281,7 +1282,7 @@ async def handle_chat_completions(request: Request):
     decoder_released = False
     route_info = {}
     try:
-        req_data = await request.json()
+        req_data = normalize_chat_request(await request.json())
 
         render_client = round_robin_pick_client(
             app.state.prefill_clients, next(tokenization_round_robin_counter)
