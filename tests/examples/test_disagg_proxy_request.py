@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 import pytest
@@ -83,6 +84,25 @@ def test_parse_chat_render_output_returns_tokens_and_effective_budget():
 
     assert prompt_token_ids == [10, 20, 30]
     assert resolved_max_tokens == 196569
+
+
+def test_upstream_service_error_preserves_response_details():
+    response = SimpleNamespace(
+        status_code=400,
+        request=SimpleNamespace(
+            url="http://7.150.2.142:7100/v1/chat/completions/render"
+        ),
+        content=b'{"error":{"message":"Input length exceeds model limit"}}',
+        headers={"content-type": "application/json"},
+    )
+
+    error = request_helpers.upstream_service_error_from_response(response)
+
+    assert error.status_code == 400
+    assert error.url == "http://7.150.2.142:7100/v1/chat/completions/render"
+    assert error.body == response.content
+    assert error.content_type == "application/json"
+    assert "Input length exceeds model limit" in str(error)
 
 
 def test_completion_without_max_tokens_uses_vllm_default():

@@ -15,7 +15,7 @@ import uuid
 
 # Third Party
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 import httpx
 import msgspec
 import numpy as np
@@ -29,7 +29,12 @@ from lmcache.v1.storage_backend.pd_backend import (
     ProxyNotif,
 )
 
-from disagg_proxy_request import build_phase_requests, parse_chat_render_output
+from disagg_proxy_request import (
+    UpstreamServiceError,
+    build_phase_requests,
+    parse_chat_render_output,
+    upstream_service_error_from_response,
+)
 
 logger = init_logger(__name__)
 
@@ -271,6 +276,25 @@ async def lifespan(app: FastAPI):
 
 # Update FastAPI app initialization to use lifespan
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(UpstreamServiceError)
+async def handle_upstream_service_error(
+    _request: Request, exc: UpstreamServiceError
+) -> Response:
+    """Return a proxied vLLM error without converting it to an HTTP 500."""
+    logger.error(
+        "Upstream service error: status=%d url=%s body=%s",
+        exc.status_code,
+        exc.url,
+        exc.body_text,
+    )
+    headers = {"content-type": exc.content_type} if exc.content_type else None
+    return Response(
+        content=exc.body,
+        status_code=exc.status_code,
+        headers=headers,
+    )
 
 
 class StatsCalculator:
@@ -596,7 +620,8 @@ async def send_request_to_service(
 
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
     response = await client.post(endpoint, json=req_data, headers=headers)
-    response.raise_for_status()
+    if not response.is_success:
+        raise upstream_service_error_from_response(response)
     return response
 
 
@@ -610,7 +635,9 @@ async def stream_service_response(
     async with client.stream(
         "POST", endpoint, json=req_data, headers=headers
     ) as response:
-        response.raise_for_status()
+        if not response.is_success:
+            await response.aread()
+            raise upstream_service_error_from_response(response)
         async for chunk in response.aiter_bytes():
             yield chunk
 

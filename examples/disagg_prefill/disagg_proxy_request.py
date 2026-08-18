@@ -6,6 +6,37 @@ from typing import Any
 DEFAULT_COMPLETION_MAX_TOKENS = 16
 
 
+class UpstreamServiceError(Exception):
+    """An HTTP error response returned by a proxied vLLM service."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        url: str,
+        body: bytes,
+        content_type: str | None,
+    ) -> None:
+        self.status_code = status_code
+        self.url = url
+        self.body = body
+        self.content_type = content_type
+        self.body_text = body.decode("utf-8", errors="replace")
+        super().__init__(
+            f"Upstream service returned {status_code} for {url}: {self.body_text}"
+        )
+
+
+def upstream_service_error_from_response(response: Any) -> UpstreamServiceError:
+    """Capture an upstream HTTP response before its details are discarded."""
+    return UpstreamServiceError(
+        status_code=response.status_code,
+        url=str(response.request.url),
+        body=response.content,
+        content_type=response.headers.get("content-type"),
+    )
+
+
 def parse_chat_render_output(
     render_output: dict[str, Any],
 ) -> tuple[list[int], int]:
