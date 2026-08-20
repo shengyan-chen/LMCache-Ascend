@@ -643,6 +643,123 @@ async def stream_service_response(
             yield chunk
 
 
+def encode_sse_data(data: dict) -> bytes:
+    return (
+        "data: " + json.dumps(data, separators=(",", ":")) + "\n\n"
+    ).encode()
+
+
+async def stream_prefill_only_completion_response(
+    prefill_output: dict, include_usage: bool
+):
+    choice = prefill_output["choices"][0]
+    base_chunk = {
+        "id": prefill_output["id"],
+        "object": "text_completion",
+        "created": prefill_output["created"],
+        "model": prefill_output["model"],
+    }
+    yield encode_sse_data(
+        {
+            **base_chunk,
+            "choices": [
+                {
+                    "index": 0,
+                    "text": choice["text"],
+                    "logprobs": choice.get("logprobs"),
+                    "finish_reason": None,
+                    "stop_reason": None,
+                }
+            ],
+            "usage": None,
+        }
+    )
+    yield encode_sse_data(
+        {
+            **base_chunk,
+            "choices": [
+                {
+                    "index": 0,
+                    "text": "",
+                    "logprobs": None,
+                    "finish_reason": choice.get("finish_reason"),
+                    "stop_reason": choice.get("stop_reason"),
+                }
+            ],
+            "usage": None,
+        }
+    )
+    if include_usage and prefill_output.get("usage") is not None:
+        yield encode_sse_data(
+            {
+                **base_chunk,
+                "choices": [],
+                "usage": prefill_output["usage"],
+            }
+        )
+    yield b"data: [DONE]\n\n"
+
+
+async def stream_prefill_only_chat_response(
+    prefill_output: dict, include_usage: bool
+):
+    choice = prefill_output["choices"][0]
+    base_chunk = {
+        "id": prefill_output["id"],
+        "object": "chat.completion.chunk",
+        "created": prefill_output["created"],
+        "model": prefill_output["model"],
+    }
+    yield encode_sse_data(
+        {
+            **base_chunk,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": ""},
+                    "logprobs": None,
+                    "finish_reason": None,
+                }
+            ],
+        }
+    )
+    yield encode_sse_data(
+        {
+            **base_chunk,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": choice["text"]},
+                    "logprobs": choice.get("logprobs"),
+                    "finish_reason": None,
+                }
+            ],
+        }
+    )
+    yield encode_sse_data(
+        {
+            **base_chunk,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "logprobs": None,
+                    "finish_reason": choice.get("finish_reason"),
+                }
+            ],
+        }
+    )
+    if include_usage and prefill_output.get("usage") is not None:
+        yield encode_sse_data(
+            {
+                **base_chunk,
+                "choices": [],
+                "usage": prefill_output["usage"],
+            }
+        )
+    yield b"data: [DONE]\n\n"
+
+
 def round_robin_pick_client(clients, idx):
     if not clients:
         raise ValueError("No clients configured")
@@ -1046,6 +1163,67 @@ async def handle_completions(request: Request):
             is_chat=False,
         )
 
+        if decode_req_data["max_tokens"] == 0:
+            prefiller_state, prefiller_info = await select_prefiller(
+                prompt_token_count
+            )
+            prefill_client = prefiller_state.client_info
+            route_info = dict(prefiller_info)
+            route_info.update(
+                {
+                    "req_id": req_id,
+                    "endpoint": "/v1/completions",
+                    "prompt_token_count": prompt_token_count,
+                    "chosen_prefiller": prefiller_state.name,
+                    "chosen_decoder": "prefill-only",
+                    "tokenization_client": tokenization_client.name,
+                    "pd_transfer_mode": "prefill-only",
+                    "pd_buffer_admission_enabled": False,
+                }
+            )
+            log_route_event("proxy_route_selected", route_info)
+
+            prefill_start = time.time()
+            prefill_output = await send_request_to_service(
+                prefill_client.client, "/v1/completions", prefill_req_data
+            )
+            prefill_ms = (time.time() - prefill_start) * 1000
+            prefiller_release_state = await release_prefiller(
+                prefiller_state,
+                prompt_token_count,
+                success=True,
+                prefill_ms=prefill_ms,
+            )
+            prefiller_released = True
+            route_info.update(
+                {
+                    "pd_slot_count": 0,
+                    "pd_slot_wait_ms": 0.0,
+                    "prefill_ms": prefill_ms,
+                    "prefiller_state_after_release": prefiller_release_state,
+                }
+            )
+            prefill_output = prefill_output.json()
+            stats_calculator.add(time.time() - st)
+
+            complete_payload = dict(route_info)
+            complete_payload.update(
+                {
+                    "total_ms": (time.time() - st) * 1000,
+                    "error": None,
+                }
+            )
+            log_route_event("proxy_route_complete", complete_payload)
+            include_usage = bool(
+                (req_data.get("stream_options") or {}).get("include_usage")
+            )
+            return StreamingResponse(
+                stream_prefill_only_completion_response(
+                    prefill_output, include_usage
+                ),
+                media_type="application/json",
+            )
+
         decoder_state, decoder_info = await select_decoder(prompt_token_count)
         route_info = dict(decoder_info)
         route_info.update(
@@ -1303,6 +1481,66 @@ async def handle_chat_completions(request: Request):
             is_chat=True,
             resolved_max_tokens=resolved_max_tokens,
         )
+
+        if decode_req_data["max_tokens"] == 0:
+            prefiller_state, prefiller_info = await select_prefiller(
+                prompt_token_count
+            )
+            prefill_client = prefiller_state.client_info
+            route_info = dict(prefiller_info)
+            route_info.update(
+                {
+                    "req_id": req_id,
+                    "endpoint": "/v1/chat/completions",
+                    "prompt_token_count": prompt_token_count,
+                    "chosen_prefiller": prefiller_state.name,
+                    "chosen_decoder": "prefill-only",
+                    "render_client": render_client.name,
+                    "resolved_max_tokens": resolved_max_tokens,
+                    "pd_transfer_mode": "prefill-only",
+                    "pd_buffer_admission_enabled": False,
+                }
+            )
+            log_route_event("proxy_route_selected", route_info)
+
+            prefill_start = time.time()
+            prefill_output = await send_request_to_service(
+                prefill_client.client, "/v1/completions", prefill_req_data
+            )
+            prefill_ms = (time.time() - prefill_start) * 1000
+            prefiller_release_state = await release_prefiller(
+                prefiller_state,
+                prompt_token_count,
+                success=True,
+                prefill_ms=prefill_ms,
+            )
+            prefiller_released = True
+            route_info.update(
+                {
+                    "pd_slot_count": 0,
+                    "pd_slot_wait_ms": 0.0,
+                    "prefill_ms": prefill_ms,
+                    "prefiller_state_after_release": prefiller_release_state,
+                }
+            )
+            prefill_output = prefill_output.json()
+            stats_calculator.add(time.time() - st)
+
+            complete_payload = dict(route_info)
+            complete_payload.update(
+                {
+                    "total_ms": (time.time() - st) * 1000,
+                    "error": None,
+                }
+            )
+            log_route_event("proxy_route_complete", complete_payload)
+            include_usage = bool(
+                (req_data.get("stream_options") or {}).get("include_usage")
+            )
+            return StreamingResponse(
+                stream_prefill_only_chat_response(prefill_output, include_usage),
+                media_type="application/json",
+            )
 
         decoder_state, decoder_info = await select_decoder(prompt_token_count)
         route_info = dict(decoder_info)
