@@ -58,6 +58,28 @@ def parse_chat_render_output(
     )
 
 
+def build_chat_phase_requests(
+    request_data: dict[str, Any],
+    prompt_token_ids: list[int],
+    *,
+    handoff_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build an internal prefill request and a native Chat decode request."""
+    prefill_request = request_data.copy()
+    prefill_request.pop("max_completion_tokens", None)
+    prefill_request.pop("stream_options", None)
+    prefill_request["prompt"] = list(prompt_token_ids)
+    prefill_request["max_tokens"] = 1
+    prefill_request["stream"] = False
+
+    decode_request = request_data.copy()
+    decode_request["kv_transfer_params"] = {
+        "lmcache.pd_handoff_id": handoff_id,
+    }
+
+    return prefill_request, decode_request
+
+
 def build_phase_requests(
     request_data: dict[str, Any],
     prompt_token_ids: list[int],

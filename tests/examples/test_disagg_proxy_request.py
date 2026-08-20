@@ -52,61 +52,64 @@ def test_normalize_chat_request_preserves_invalid_tool_choice_for_validation(
     assert normalized is not request_data
 
 
-@pytest.mark.parametrize(
-    ("request_data", "resolved_max_tokens", "expected_decode_tokens"),
-    [
-        ({"max_completion_tokens": 150}, 140, 139),
-        ({"max_tokens": 120}, 110, 109),
-        ({"max_tokens": 120, "max_completion_tokens": 150}, 140, 139),
-    ],
-)
-def test_chat_budget_is_normalized_for_internal_completion_requests(
-    request_data, resolved_max_tokens, expected_decode_tokens
-):
-    request_data.update(
-        {
-            "model": "MiniMax-M2.7",
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream_options": {"include_usage": True},
-            "temperature": 0.7,
-        }
-    )
+def test_chat_decode_preserves_native_request_and_full_output_budget():
+    request_data = {
+        "model": "MiniMax-M2.7",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        "tool_choice": "auto",
+        "max_completion_tokens": 150,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "temperature": 0.7,
+    }
     original = deepcopy(request_data)
 
-    prefill_request, decode_request = build_phase_requests(
+    prefill_request, decode_request = request_helpers.build_chat_phase_requests(
         request_data,
         [10, 20, 30],
-        is_chat=True,
-        resolved_max_tokens=resolved_max_tokens,
+        handoff_id="handoff-123",
     )
 
     assert request_data == original
-    assert prefill_request["max_tokens"] == 1
-    assert decode_request["max_tokens"] == expected_decode_tokens
     assert "max_completion_tokens" not in prefill_request
-    assert "max_completion_tokens" not in decode_request
     assert "stream_options" not in prefill_request
-    assert decode_request["stream_options"] == {"include_usage": True}
-    assert prefill_request["stream"] is False
-    assert decode_request["stream"] is True
-    assert prefill_request["temperature"] == 0.7
-    assert decode_request["temperature"] == 0.7
-
-    decode_request["prompt"].append(40)
     assert prefill_request["prompt"] == [10, 20, 30]
-    assert decode_request["prompt"] == [10, 20, 30, 40]
+    assert prefill_request["max_tokens"] == 1
+    assert prefill_request["stream"] is False
+    assert decode_request == {
+        **original,
+        "kv_transfer_params": {"lmcache.pd_handoff_id": "handoff-123"},
+    }
+    assert "prompt" not in decode_request
 
 
-def test_chat_without_token_budget_uses_rendered_context_limit():
-    prefill_request, decode_request = build_phase_requests(
-        {"messages": [{"role": "user", "content": "hello"}]},
-        [10, 20],
-        is_chat=True,
-        resolved_max_tokens=196569,
+def test_chat_decode_leaves_omitted_output_limit_for_vllm_to_resolve():
+    request_data = {
+        "model": "MiniMax-M2.7",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": False,
+    }
+
+    prefill_request, decode_request = request_helpers.build_chat_phase_requests(
+        request_data, [10, 20], handoff_id="handoff-456"
     )
 
     assert prefill_request["max_tokens"] == 1
-    assert decode_request["max_tokens"] == 196568
+    assert "max_completion_tokens" not in decode_request
+    assert "max_tokens" not in decode_request
+    assert decode_request["stream"] is False
+    assert decode_request["kv_transfer_params"] == {
+        "lmcache.pd_handoff_id": "handoff-456"
+    }
 
 
 def test_parse_chat_render_output_returns_tokens_and_effective_budget():
