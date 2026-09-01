@@ -89,6 +89,16 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
         self._pd_request_keys: dict[str, set[CacheEngineKey]] = {}
         self.data_lock = threading.Lock()
 
+        # Resolve the physical page layout from the registered KV caches.
+        # Legacy metadata.kv_shape cannot represent tuple-based DSA caches.
+        self._metadata = metadata
+        (
+            self._fmt,
+            self._kv_shapes,
+            self._kv_dtypes,
+            self._page_size_bytes,
+        ) = self._resolve_page_layout(config, metadata)
+
         self.memory_allocator = self.initialize_allocator(config, metadata)
         assert isinstance(self.memory_allocator, PagedCpuGpuMemoryAllocator)
 
@@ -158,9 +168,11 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
             buffer_type.append("cpu")
             align_bytes.append(self.memory_allocator.cpu_allocator.align_bytes)
 
-        assert buffer_ptr, (
-            "No buffers registered — at least one of NPU or CPU must be configured"
-        )
+        if not buffer_ptr:
+            raise RuntimeError(
+                "No buffers registered: at least one of NPU or CPU must be configured"
+            )
+        self._validate_registered_buffers(align_bytes)
 
         self.transfer_channel = CreateTransferChannel(
             channel_type=config.transfer_channel,
@@ -173,6 +185,15 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
             tp_rank=self.tp_rank,
             peer_init_url=peer_init_url,
         )
+        channel_page_size = getattr(self.transfer_channel, "page_size", None)
+        if (
+            isinstance(channel_page_size, int)
+            and channel_page_size != self._page_size_bytes
+        ):
+            raise RuntimeError(
+                "Transfer channel page size does not match the resolved PD layout: "
+                f"expected={self._page_size_bytes}, actual={channel_page_size}"
+            )
 
         # Role-specific initialization
         if self.pd_config.role == "sender":
@@ -186,11 +207,78 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
 
         self.full_chunk_size = config.chunk_size
 
-        # Cache metadata for proxy creation on receiver side
-        self._metadata = metadata
-        self._fmt = resolve_memory_format(metadata.use_mla)
-        self._kv_shapes = [torch.Size(metadata.kv_shape)]
-        self._kv_dtypes = [metadata.kv_dtype]
+    @staticmethod
+    def _resolve_page_layout(
+        config: LMCacheEngineConfig,
+        metadata: LMCacheMetadata,
+    ) -> tuple[MemoryFormat, list[torch.Size], list[torch.dtype], int]:
+        """Resolve the full-chunk PD page layout from registered KV caches."""
+        layer_groups = metadata.kv_layer_groups_manager.kv_layer_groups
+        layout_source = (
+            "kv_layer_groups_manager" if layer_groups else "legacy_metadata_fallback"
+        )
+
+        fmt = resolve_memory_format(metadata.use_mla)
+        shapes = [torch.Size(shape) for shape in metadata.get_shapes(config.chunk_size)]
+        dtypes = list(metadata.get_dtypes())
+
+        if len(shapes) != len(dtypes):
+            raise ValueError(
+                "PD page layout has different shape and dtype group counts: "
+                f"shapes={len(shapes)}, dtypes={len(dtypes)}"
+            )
+
+        # AllocRequest and PullReadyNotif currently carry only one shape/dtype.
+        if len(shapes) != 1:
+            raise NotImplementedError(
+                "AscendPDBackend currently supports exactly one KV layer group; "
+                f"got {len(shapes)}"
+            )
+
+        shape = shapes[0]
+        if len(shape) != 4:
+            raise ValueError(
+                f"Unsupported PD KV page rank: shape={shape}, format={fmt}"
+            )
+
+        token_dim = fmt.token_dim()
+        if shape[token_dim] != config.chunk_size:
+            raise ValueError(
+                "PD full page must use config.chunk_size: "
+                f"shape={shape}, token_dim={token_dim}, "
+                f"chunk_size={config.chunk_size}"
+            )
+        if any(dim <= 0 for dim in shape):
+            raise ValueError(f"PD page shape must be positive: {shape}")
+
+        page_size_bytes = get_size_bytes(shapes, dtypes)
+        if page_size_bytes <= 0:
+            raise ValueError(f"PD page size must be positive, got {page_size_bytes}")
+
+        if not layer_groups:
+            logger.warning(
+                "PD page layout is using legacy metadata fallback. Latest DSA "
+                "connectors must register real KV caches before LMCache post_init."
+            )
+
+        logger.info(
+            "Resolved PD page layout: source=%s, shapes=%s, dtypes=%s, "
+            "format=%s, page_size_bytes=%d",
+            layout_source,
+            shapes,
+            dtypes,
+            fmt,
+            page_size_bytes,
+        )
+        return fmt, shapes, dtypes, page_size_bytes
+
+    def _validate_registered_buffers(self, align_bytes: list[int]) -> None:
+        """Ensure every channel buffer uses the resolved fixed page size."""
+        if any(value != self._page_size_bytes for value in align_bytes):
+            raise RuntimeError(
+                "PD registered buffers do not share the resolved page size: "
+                f"expected={self._page_size_bytes}, actual={align_bytes}"
+            )
 
     def initialize_allocator(
         self, config: LMCacheEngineConfig, metadata: LMCacheMetadata
@@ -200,10 +288,10 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
         torch.npu.set_device(npu_corrected_device)
 
         paged_mem_allocator = PagedCpuGpuMemoryAllocator()
-        fmt = resolve_memory_format(metadata.use_mla)
-        sizes = [torch.Size(metadata.kv_shape)]
-        dtypes = [metadata.kv_dtype]
-        total_size = get_size_bytes(sizes, dtypes)
+        fmt = self._fmt
+        sizes = self._kv_shapes
+        dtypes = self._kv_dtypes
+        total_size = self._page_size_bytes
 
         if self.pd_config.buffer_device.startswith("npu"):
             # NPU allocator — needed for RDMA buffer registration and
@@ -215,8 +303,12 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
                 npu_aligned_byte, sizes, dtypes, fmt, npu_corrected_device
             )
             logger.info(
-                "Initialized NPU allocator: %.2f MB",
+                "Initialized NPU allocator: %.2f MB, pages=%d, "
+                "page_size_bytes=%d, requested_bytes=%d",
                 npu_aligned_byte / (1024 * 1024),
+                npu_aligned_byte // total_size,
+                total_size,
+                config.pd_buffer_size,
             )
 
         if self.pd_config.buffer_device == "cpu" or self.use_cpu_offload:
@@ -232,8 +324,12 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
             )
 
             logger.info(
-                "Initialized CPU allocator: %.2f MB",
+                "Initialized CPU allocator: %.2f MB, pages=%d, "
+                "page_size_bytes=%d, requested_bytes=%d",
                 cpu_aligned_byte / (1024 * 1024),
+                cpu_aligned_byte // total_size,
+                total_size,
+                cpu_buffer_size,
             )
 
         return paged_mem_allocator

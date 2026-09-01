@@ -7,6 +7,7 @@ hardware and are gated behind ``@pytest.mark.skipif``.
 """
 
 # Standard
+from types import SimpleNamespace
 from typing import Tuple
 from unittest.mock import MagicMock, patch
 import threading
@@ -20,9 +21,12 @@ prepare_environment()
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
+from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata
+from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.pd_backend import AllocRequest
 import msgspec
+import pytest
 import torch
 
 # First Party
@@ -44,6 +48,30 @@ def _make_key(key_id: str = "test_key") -> CacheEngineKey:
 
 DEFAULT_SHAPE = torch.Size([2, 2, 256, 512])
 DEFAULT_DTYPE = torch.bfloat16
+
+
+def _make_metadata(
+    kv_shape: tuple[int, int, int, int, int],
+    use_mla: bool,
+    kv_layer_groups_manager: KVLayerGroupsManager | None = None,
+) -> LMCacheMetadata:
+    return LMCacheMetadata(
+        model_name="test_model",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=DEFAULT_DTYPE,
+        kv_shape=kv_shape,
+        use_mla=use_mla,
+        role="worker",
+        chunk_size=256,
+        kv_layer_groups_manager=(
+            kv_layer_groups_manager
+            if kv_layer_groups_manager is not None
+            else KVLayerGroupsManager()
+        ),
+    )
 
 
 def _make_mock_mem_obj(
@@ -171,6 +199,121 @@ def _make_pd_backend_stub(
 
 class TestAscendPDBackend:
     """Mock-based unit tests for AscendPDBackend logic."""
+
+    def test_runtime_dsa_layout_overrides_legacy_metadata(self):
+        """The registered DSA tuple, not legacy 576, defines the PD page."""
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.backend import AscendPDBackend
+
+        layer_groups = KVLayerGroupsManager()
+        kv_caches = {
+            f"model.layers.{layer_idx}.self_attn.attn": (
+                torch.empty((1, 1, 1, 512), dtype=torch.bfloat16),
+                torch.empty((1, 1, 1, 64), dtype=torch.bfloat16),
+                torch.empty((1, 1, 1, 128), dtype=torch.bfloat16),
+            )
+            for layer_idx in range(78)
+        }
+        layer_groups.build_kv_layer_groups(kv_caches)
+        metadata = _make_metadata(
+            kv_shape=(78, 1, 256, 1, 576),
+            use_mla=True,
+            kv_layer_groups_manager=layer_groups,
+        )
+
+        fmt, shapes, dtypes, page_size_bytes = AscendPDBackend._resolve_page_layout(
+            SimpleNamespace(chunk_size=256), metadata
+        )
+
+        assert metadata.kv_shape[-1] == 576
+        assert layer_groups.num_groups == 1
+        assert layer_groups.kv_layer_groups[0].hidden_dim_size == 704
+        assert fmt is MemoryFormat.KV_MLA_FMT
+        assert shapes == [torch.Size([1, 78, 256, 704])]
+        assert dtypes == [torch.bfloat16]
+        assert page_size_bytes == 28_114_944
+
+    def test_mha_legacy_layout_fallback_preserves_page_size(self):
+        """A standard MHA model remains compatible without runtime groups."""
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.backend import AscendPDBackend
+
+        metadata = _make_metadata(
+            kv_shape=(32, 2, 256, 8, 128),
+            use_mla=False,
+        )
+
+        fmt, shapes, dtypes, page_size_bytes = AscendPDBackend._resolve_page_layout(
+            SimpleNamespace(chunk_size=256), metadata
+        )
+
+        assert fmt is MemoryFormat.KV_2LTD
+        assert shapes == [torch.Size([2, 32, 256, 1024])]
+        assert dtypes == [torch.bfloat16]
+        assert page_size_bytes == 33_554_432
+
+    def test_allocator_uses_resolved_page_layout(self):
+        """Both NPU and CPU allocators receive the canonical DSA page."""
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.backend import AscendPDBackend
+
+        page_size_bytes = 28_114_944
+        shape = torch.Size([1, 78, 256, 704])
+        backend = object.__new__(AscendPDBackend)
+        backend.pd_config = SimpleNamespace(buffer_device="npu:0")
+        backend.use_cpu_offload = True
+        backend._fmt = MemoryFormat.KV_MLA_FMT
+        backend._kv_shapes = [shape]
+        backend._kv_dtypes = [torch.bfloat16]
+        backend._page_size_bytes = page_size_bytes
+
+        config = SimpleNamespace(
+            pd_buffer_size=page_size_bytes * 2 + 1,
+            pd_cpu_buffer_size=page_size_bytes * 3 + 1,
+        )
+        metadata = SimpleNamespace(worker_id=0)
+        allocator = MagicMock()
+
+        with (
+            patch(
+                "lmcache_ascend.v1.storage_backend.pd.backend."
+                "PagedCpuGpuMemoryAllocator",
+                return_value=allocator,
+            ),
+            patch(
+                "lmcache_ascend.v1.storage_backend.pd.backend.get_correct_device",
+                return_value="npu:0",
+            ),
+            patch("lmcache_ascend.v1.storage_backend.pd.backend.torch.npu.set_device"),
+        ):
+            result = AscendPDBackend.initialize_allocator(backend, config, metadata)
+
+        assert result is allocator
+        allocator.init_gpu_memory_allocator.assert_called_once_with(
+            page_size_bytes * 3,
+            [shape],
+            [torch.bfloat16],
+            MemoryFormat.KV_MLA_FMT,
+            "npu:0",
+        )
+        allocator.init_cpu_memory_allocator.assert_called_once_with(
+            page_size_bytes * 4,
+            [shape],
+            [torch.bfloat16],
+            MemoryFormat.KV_MLA_FMT,
+        )
+
+    def test_registered_buffers_reject_mismatched_page_size(self):
+        """HCCL buffers cannot be registered with different page sizes."""
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.backend import AscendPDBackend
+
+        backend = object.__new__(AscendPDBackend)
+        backend._page_size_bytes = 28_114_944
+
+        backend._validate_registered_buffers([28_114_944, 28_114_944])
+        with pytest.raises(RuntimeError, match="resolved page size"):
+            backend._validate_registered_buffers([28_114_944, 23_003_136])
 
     def test_pd_message_types(self):
         """All Ascend PD message types roundtrip through msgspec."""
