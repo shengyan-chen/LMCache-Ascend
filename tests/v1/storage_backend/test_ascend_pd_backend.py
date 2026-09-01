@@ -847,6 +847,167 @@ class TestAscendPDBackend:
             "__lmcache_pd_handoff__:handoff-promote"
         )
 
+    def test_pull_delay_handoff_closes_pullready_to_lookup_race(self):
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.receiver_mixin import (
+            AscendPDReceiverMixin,
+        )
+
+        backend = _make_pd_backend_stub(
+            delay_pull=True,
+            buffer_device="npu:0",
+            pull_mode=True,
+        )
+        backend._send_pull_done_to_sender = MagicMock()
+        key = _make_key("shared_handoff_race")
+
+        first = PullReadyNotif(
+            pull_id="pull_old",
+            handoff_id="handoff_old",
+            keys=[key.to_string()],
+            sender_buffer_uuids=["old-uuid"],
+            sender_mem_indexes=[0],
+            sender_id="sender_old",
+            sender_done_url="tcp://sender-old:9999",
+            fmt=MemoryFormat.KV_2LTD.value,
+            shape=list(DEFAULT_SHAPE),
+            dtype="bfloat16",
+            last_chunk_toks=256,
+        )
+        first_ack, _ = AscendPDReceiverMixin._handle_pull_delay(
+            backend, first, "sender_old"
+        )
+        assert first_ack.already_sent_indexes == []
+        assert backend.promote_handoff_lease("handoff_old", "request_old") == 1
+
+        second = PullReadyNotif(
+            pull_id="pull_new",
+            handoff_id="handoff_new",
+            keys=[key.to_string()],
+            sender_buffer_uuids=["new-uuid"],
+            sender_mem_indexes=[1],
+            sender_id="sender_new",
+            sender_done_url="tcp://sender-new:9999",
+            fmt=MemoryFormat.KV_2LTD.value,
+            shape=list(DEFAULT_SHAPE),
+            dtype="bfloat16",
+            last_chunk_toks=256,
+        )
+        second_ack, _ = AscendPDReceiverMixin._handle_pull_delay(
+            backend, second, "sender_new"
+        )
+        assert second_ack.already_sent_indexes == [0]
+
+        # The previous owner releases after PullReady ACK but before the new
+        # decoder lookup. The synthetic owner must keep the entry and sender
+        # context alive across this exact interleaving.
+        backend.release_request_lease("request_old")
+        assert key in backend._pd_entries
+        backend._send_pull_done_to_sender.assert_not_called()
+
+        assert backend.promote_handoff_lease("handoff_new", "request_new") == 1
+        assert backend._pd_entries[key].owners == {"request_new"}
+        backend.release_request_lease("request_new")
+
+        assert key not in backend._pd_entries
+        backend._send_pull_done_to_sender.assert_called_once_with(
+            "sender_old", "pull_old"
+        )
+
+    def test_expired_delay_pull_handoff_releases_entry_and_sender(self):
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.receiver_mixin import (
+            AscendPDReceiverMixin,
+        )
+
+        backend = _make_pd_backend_stub(
+            delay_pull=True,
+            buffer_device="npu:0",
+            pull_mode=True,
+        )
+        backend._send_pull_done_to_sender = MagicMock()
+        key = _make_key("expired_handoff")
+        msg = PullReadyNotif(
+            pull_id="pull_expired",
+            handoff_id="handoff_expired",
+            keys=[key.to_string()],
+            sender_buffer_uuids=["expired-uuid"],
+            sender_mem_indexes=[0],
+            sender_id="sender_expired",
+            sender_done_url="tcp://sender-expired:9999",
+            fmt=MemoryFormat.KV_2LTD.value,
+            shape=list(DEFAULT_SHAPE),
+            dtype="bfloat16",
+            last_chunk_toks=256,
+        )
+
+        ack, _ = AscendPDReceiverMixin._handle_pull_delay(
+            backend, msg, "sender_expired"
+        )
+        lease_id = "__lmcache_pd_handoff__:handoff_expired"
+        backend._pd_handoff_deadlines[lease_id] = time.monotonic() - 1
+
+        assert ack.alloc_failed is False
+        assert backend.release_expired_handoff_leases() == 1
+        assert key not in backend._pd_entries
+        backend._send_pull_done_to_sender.assert_called_once_with(
+            "sender_expired", "pull_expired"
+        )
+
+    def test_stale_expiry_snapshot_does_not_release_refreshed_handoff(self):
+        backend = _make_pd_backend_stub()
+        key = _make_key("refreshed_handoff")
+        mem_obj = _make_mock_mem_obj()
+        backend.put_with_handoff_lease(key, mem_obj, "handoff-refreshed")
+        lease_id = "__lmcache_pd_handoff__:handoff-refreshed"
+        stale_deadline = backend._pd_handoff_deadlines[lease_id]
+
+        with backend.data_lock:
+            backend._refresh_handoff_deadline_locked(lease_id)
+
+        released = backend.release_request_lease(
+            lease_id,
+            expected_handoff_deadline=stale_deadline,
+        )
+
+        assert released is False
+        assert key in backend._pd_entries
+        assert lease_id in backend._pd_entries[key].owners
+
+    def test_promote_handoff_rolls_back_partial_real_owner_acquisition(self):
+        backend = _make_pd_backend_stub()
+        context = MagicMock()
+        keys = [_make_key("rollback-0"), _make_key("rollback-1")]
+        for index, key in enumerate(keys):
+            backend.put_with_handoff_lease(
+                key,
+                _make_proxy(context=context, chunk_index=index),
+                "handoff-rollback",
+            )
+
+        original_ensure = backend._ensure_request_lease_locked
+        real_owner_attempts = 0
+
+        def fail_second_real_owner(key, entry, request_id):
+            nonlocal real_owner_attempts
+            if request_id == "decoder-rollback":
+                real_owner_attempts += 1
+                if real_owner_attempts == 2:
+                    raise RuntimeError("injected promotion failure")
+            return original_ensure(key, entry, request_id)
+
+        backend._ensure_request_lease_locked = fail_second_real_owner
+
+        claimed = backend.promote_handoff_lease("handoff-rollback", "decoder-rollback")
+
+        lease_id = "__lmcache_pd_handoff__:handoff-rollback"
+        assert claimed == 0
+        assert "decoder-rollback" not in backend._pd_request_keys
+        assert backend._pd_request_keys[lease_id] == set(keys)
+        for key in keys:
+            assert backend._pd_entries[key].owners == {lease_id}
+        context.release_request.assert_called_once_with("decoder-rollback")
+
     def test_proxy_submit_resolve_batch_fallback_uses_sync_batched_read(self):
         """No submit_batched_read: fallback uses synchronous batched_read."""
 
