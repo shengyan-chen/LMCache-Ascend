@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 import asyncio
 import json
+import uuid
 
 # Third Party
 import pytest
@@ -157,6 +158,14 @@ def test_completion_endpoint_handles_prefill_only_and_decode_paths(
         else:
             select_decoder.assert_awaited_once_with(2)
             release_decoder.assert_awaited_once()
+            prefill_handoff = service_calls[1][2]["kv_transfer_params"]["disagg_spec"][
+                "req_id"
+            ]
+            decode_handoff = decode_requests[0]["kv_transfer_params"][
+                "lmcache.pd_handoff_id"
+            ]
+            assert decode_handoff == prefill_handoff
+            assert uuid.UUID(decode_handoff).hex == decode_handoff
             assert decode_requests == [
                 {
                     "model": "MiniMax-M2.7",
@@ -164,6 +173,9 @@ def test_completion_endpoint_handles_prefill_only_and_decode_paths(
                     "max_tokens": 3,
                     "stream": True,
                     "stream_options": {"include_usage": True},
+                    "kv_transfer_params": {
+                        "lmcache.pd_handoff_id": decode_handoff,
+                    },
                 }
             ]
             assert b'"text":"A"' in body
@@ -292,8 +304,19 @@ def test_chat_endpoint_preserves_native_stream_and_nonstream_responses(
         assert prefill_requests[0]["max_tokens"] == 1
         assert prefill_requests[0]["stream"] is False
         assert "disagg_spec" in prefill_requests[0]["kv_transfer_params"]
-        assert decode_requests == [request_data]
-        assert "kv_transfer_params" not in decode_requests[0]
+        prefill_handoff = prefill_requests[0]["kv_transfer_params"]["disagg_spec"][
+            "req_id"
+        ]
+        decode_handoff = decode_requests[0]["kv_transfer_params"][
+            "lmcache.pd_handoff_id"
+        ]
+        assert decode_handoff == prefill_handoff
+        assert uuid.UUID(decode_handoff).hex == decode_handoff
+        expected_decode = deepcopy(request_data)
+        expected_decode["kv_transfer_params"] = {
+            "lmcache.pd_handoff_id": decode_handoff,
+        }
+        assert decode_requests == [expected_decode]
         release_decoder.assert_awaited_once()
 
     asyncio.run(scenario())

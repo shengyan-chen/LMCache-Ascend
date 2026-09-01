@@ -8,7 +8,7 @@ hardware and are gated behind ``@pytest.mark.skipif``.
 
 # Standard
 from typing import Tuple
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 import threading
 import time
 
@@ -167,6 +167,14 @@ def _make_pd_backend_stub(
             request_id,
         )
     )
+    backend._detach_request_lease_locked = (
+        lambda key, entry, request_id: AscendPDBackend._detach_request_lease_locked(
+            backend,
+            key,
+            entry,
+            request_id,
+        )
+    )
     backend._refresh_handoff_deadline_locked = lambda lease_id: (
         AscendPDBackend._refresh_handoff_deadline_locked(backend, lease_id)
     )
@@ -196,6 +204,9 @@ def _make_pd_backend_stub(
     )
     backend.release_expired_handoff_leases = lambda: (
         AscendPDBackend.release_expired_handoff_leases(backend)
+    )
+    backend.promote_handoff_lease = lambda handoff_id, request_id: (
+        AscendPDBackend.promote_handoff_lease(backend, handoff_id, request_id)
     )
 
     return backend
@@ -812,6 +823,29 @@ class TestAscendPDBackend:
 
         assert ack == PullReadyDoneAck(already_sent_indexes=[], alloc_failed=True)
         assert post_ack_fn is None
+
+    def test_promote_handoff_lease_acquires_request_before_releasing_synthetic(self):
+        backend = _make_pd_backend_stub()
+        context = MagicMock()
+        key = _make_key("promote_handoff")
+        proxy = _make_proxy(context=context)
+
+        inserted, existing = backend.put_with_handoff_lease(
+            key, proxy, "handoff-promote"
+        )
+        claimed = backend.promote_handoff_lease("handoff-promote", "decoder-request")
+
+        assert inserted is True
+        assert existing is None
+        assert claimed == 1
+        assert backend._pd_entries[key].owners == {"decoder-request"}
+        assert context.acquire_request.call_args_list == [
+            call("__lmcache_pd_handoff__:handoff-promote"),
+            call("decoder-request"),
+        ]
+        context.release_request.assert_called_once_with(
+            "__lmcache_pd_handoff__:handoff-promote"
+        )
 
     def test_proxy_submit_resolve_batch_fallback_uses_sync_batched_read(self):
         """No submit_batched_read: fallback uses synchronous batched_read."""

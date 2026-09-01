@@ -74,6 +74,7 @@ def test_chat_decode_preserves_native_request_and_full_output_budget():
     prefill_request, decode_request = request_helpers.build_chat_phase_requests(
         request_data,
         [10, 20, 30],
+        handoff_id="handoff-chat-1",
     )
 
     assert request_data == original
@@ -82,10 +83,11 @@ def test_chat_decode_preserves_native_request_and_full_output_budget():
     assert prefill_request["prompt"] == [10, 20, 30]
     assert prefill_request["max_tokens"] == 1
     assert prefill_request["stream"] is False
-    assert decode_request == original
+    expected_decode = deepcopy(original)
+    expected_decode["kv_transfer_params"] = {"lmcache.pd_handoff_id": "handoff-chat-1"}
+    assert decode_request == expected_decode
     assert decode_request is not request_data
     assert "prompt" not in decode_request
-    assert "kv_transfer_params" not in decode_request
 
 
 def test_chat_decode_leaves_omitted_output_limit_for_vllm_to_resolve():
@@ -98,13 +100,16 @@ def test_chat_decode_leaves_omitted_output_limit_for_vllm_to_resolve():
     prefill_request, decode_request = request_helpers.build_chat_phase_requests(
         request_data,
         [10, 20],
+        handoff_id="handoff-chat-2",
     )
 
     assert prefill_request["max_tokens"] == 1
     assert "max_completion_tokens" not in decode_request
     assert "max_tokens" not in decode_request
     assert decode_request["stream"] is False
-    assert "kv_transfer_params" not in decode_request
+    assert decode_request["kv_transfer_params"] == {
+        "lmcache.pd_handoff_id": "handoff-chat-2"
+    }
 
 
 def test_parse_chat_render_output_returns_tokens_and_effective_budget():

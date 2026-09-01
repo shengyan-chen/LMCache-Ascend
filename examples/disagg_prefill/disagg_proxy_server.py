@@ -11,6 +11,7 @@ import json
 import math
 import os
 import time
+import uuid
 
 # Third Party
 from disagg_proxy_request import (
@@ -1077,7 +1078,7 @@ async def release_pd_buffer_slots(
 async def handle_completions(request: Request):
     global counter, stats_calculator
     counter += 1
-    req_id = str(counter)  # we use counter as req_id
+    req_id = uuid.uuid4().hex
 
     st = time.time()
     slots = 0  # slots to release on error; set after successful acquire only
@@ -1234,7 +1235,9 @@ async def handle_completions(request: Request):
         decode_req_data["prompt"].append(
             prefill_output["kv_transfer_params"]["first_tok"]
         )
-        decode_req_data.pop("kv_transfer_params", None)
+        decode_req_data["kv_transfer_params"] = {
+            "lmcache.pd_handoff_id": req_id,
+        }
 
         route_log_base = dict(route_info)
         log_route_event("proxy_route_prefill_done", route_log_base)
@@ -1383,7 +1386,7 @@ async def handle_completions(request: Request):
 async def handle_chat_completions(request: Request):
     global counter, stats_calculator
     counter += 1
-    req_id = str(counter)
+    req_id = uuid.uuid4().hex
 
     st = time.time()
     slots = 0  # slots to release on error; set after successful acquire only
@@ -1414,6 +1417,7 @@ async def handle_chat_completions(request: Request):
         prefill_req_data, decode_req_data = build_chat_phase_requests(
             req_data,
             prompt_token_ids,
+            handoff_id=req_id,
         )
 
         decoder_state, decoder_info = await select_decoder(prompt_token_count)

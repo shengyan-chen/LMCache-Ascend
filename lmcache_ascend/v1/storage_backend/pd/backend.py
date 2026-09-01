@@ -446,6 +446,26 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
             entry.proxy_leases[request_id] = request_proxy
         return True
 
+    def _detach_request_lease_locked(
+        self,
+        key: CacheEngineKey,
+        entry: PDEntry,
+        request_id: str,
+    ):
+        """Detach owner metadata and return its proxy transfer context."""
+        if request_id not in entry.owners:
+            return None
+
+        entry.owners.remove(request_id)
+        owned_keys = self._pd_request_keys.get(request_id)
+        if owned_keys is not None:
+            owned_keys.discard(key)
+            if not owned_keys:
+                self._pd_request_keys.pop(request_id, None)
+
+        proxy = entry.proxy_leases.pop(request_id, None)
+        return proxy.transfer_context if proxy is not None else None
+
     @staticmethod
     def _release_context_leases(transfer_contexts, request_id: str) -> None:
         for transfer_context in transfer_contexts:
@@ -501,6 +521,72 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
             self._pd_entries[key] = entry
             self._refresh_handoff_deadline_locked(lease_id)
             return True, None
+
+    def promote_handoff_lease(self, handoff_id: str, request_id: str) -> int:
+        """Replace a PullReady handoff owner with the real decoder request."""
+        if not handoff_id or not request_id or request_id == "unspecified":
+            return 0
+
+        lease_id = make_pd_handoff_lease_id(handoff_id)
+        acquired_keys: list[CacheEngineKey] = []
+        request_contexts_to_rollback = []
+        handoff_contexts_to_release = []
+        claimed_keys = 0
+        error: Optional[Exception] = None
+
+        with self.data_lock:
+            handoff_keys = list(self._pd_request_keys.get(lease_id, set()))
+            if not handoff_keys:
+                return 0
+
+            try:
+                # Acquire every real owner before releasing any synthetic
+                # owner, so a shared transfer context never reaches zero.
+                for key in handoff_keys:
+                    entry = self._pd_entries.get(key)
+                    if entry is None or lease_id not in entry.owners:
+                        raise RuntimeError(
+                            f"PD handoff {handoff_id} lost protected key {key}"
+                        )
+                    if self._ensure_request_lease_locked(key, entry, request_id):
+                        acquired_keys.append(key)
+
+                for key in handoff_keys:
+                    entry = self._pd_entries.get(key)
+                    assert entry is not None
+                    context = self._detach_request_lease_locked(key, entry, lease_id)
+                    if context is not None:
+                        handoff_contexts_to_release.append(context)
+                self._pd_handoff_deadlines.pop(lease_id, None)
+                claimed_keys = len(handoff_keys)
+            except Exception as exc:
+                error = exc
+                for key in acquired_keys:
+                    entry = self._pd_entries.get(key)
+                    if entry is None:
+                        continue
+                    context = self._detach_request_lease_locked(key, entry, request_id)
+                    if context is not None:
+                        request_contexts_to_rollback.append(context)
+
+        self._release_context_leases(request_contexts_to_rollback, request_id)
+        if error is not None:
+            logger.error(
+                "Failed to promote PD handoff %s to request %s: %s",
+                handoff_id,
+                request_id,
+                error,
+            )
+            return 0
+
+        self._release_context_leases(handoff_contexts_to_release, lease_id)
+        logger.debug(
+            "Promoted PD handoff %s to request %s for %d keys.",
+            handoff_id,
+            request_id,
+            claimed_keys,
+        )
+        return claimed_keys
 
     def release_expired_handoff_leases(self) -> int:
         """Release PullReady handoffs whose decoder request never arrived."""
