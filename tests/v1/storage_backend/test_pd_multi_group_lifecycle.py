@@ -62,6 +62,9 @@ def _backend():
     backend.data = {}
     backend._pd_entries = {}
     backend._pd_request_keys = {}
+    backend._pd_handoff_deadlines = {}
+    backend._pd_handoff_lease_ttl = 300.0
+    backend.tp_rank = 0
     backend.data_lock = threading.Lock()
     backend._metadata = MagicMock()
     backend._metadata.get_num_groups.return_value = 2
@@ -144,6 +147,7 @@ def test_multi_group_delay_pull_clones_keep_partial_layout_and_request_ownership
     keys = [_key(0), _key(1)]
     message = PullReadyNotif(
         pull_id="pull-1",
+        handoff_id="handoff-1",
         keys=[key.to_string() for key in keys],
         sender_buffer_uuids=["buffer-0", "buffer-1"],
         sender_mem_indexes=[10, 11],
@@ -160,6 +164,7 @@ def test_multi_group_delay_pull_clones_keep_partial_layout_and_request_ownership
     prototypes = [backend.data[key] for key in keys]
     context = prototypes[0].transfer_context
     assert prototypes[1].transfer_context is context
+    assert context._active_lease_count == 2
 
     # #274: temporary deduplication pins must not consume the prototype.
     pinned = backend._contains_and_pin(keys[0])
@@ -171,6 +176,9 @@ def test_multi_group_delay_pull_clones_keep_partial_layout_and_request_ownership
     for request in ("req-1", "req-2"):
         assert backend.batched_contains_and_lease(keys, request) == 2
         assert backend.batched_contains_and_lease(keys, request) == 2
+    assert context._active_lease_count == 6
+    backend.release_handoff_lease(message.handoff_id)
+    assert backend._pd_handoff_deadlines == {}
     assert context._active_lease_count == 4
     first = backend.batched_get_blocking_for_request(keys, "req-1")
     second = backend.batched_get_blocking_for_request(keys, "req-2")
