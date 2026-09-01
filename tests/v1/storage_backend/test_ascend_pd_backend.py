@@ -112,6 +112,9 @@ def _make_pd_backend_stub(
     backend = MagicMock()
     backend._pd_entries = {}
     backend._pd_request_keys = {}
+    backend._pd_handoff_deadlines = {}
+    backend._pd_handoff_lease_ttl = 300.0
+    backend.tp_rank = 0
 
     class _PDDataDict(dict):
         def __setitem__(self, key, value):
@@ -158,6 +161,15 @@ def _make_pd_backend_stub(
             request_id,
         )
     )
+    backend._release_context_leases = (
+        lambda contexts, request_id: AscendPDBackend._release_context_leases(
+            contexts,
+            request_id,
+        )
+    )
+    backend._refresh_handoff_deadline_locked = lambda lease_id: (
+        AscendPDBackend._refresh_handoff_deadline_locked(backend, lease_id)
+    )
     backend._delete_pd_entry_locked = (
         lambda key, entry, release_obj: AscendPDBackend._delete_pd_entry_locked(
             backend,
@@ -165,6 +177,25 @@ def _make_pd_backend_stub(
             entry,
             release_obj,
         )
+    )
+    backend._partition_keys_with_handoff = lambda keys, handoff_id: (
+        AscendPDBackend._partition_keys_with_handoff(backend, keys, handoff_id)
+    )
+    backend.put_with_handoff_lease = lambda key, obj, handoff_id: (
+        AscendPDBackend.put_with_handoff_lease(backend, key, obj, handoff_id)
+    )
+    backend.release_request_lease = lambda request_id, expected_handoff_deadline=None: (
+        AscendPDBackend.release_request_lease(
+            backend,
+            request_id,
+            expected_handoff_deadline=expected_handoff_deadline,
+        )
+    )
+    backend.release_handoff_lease = lambda handoff_id: (
+        AscendPDBackend.release_handoff_lease(backend, handoff_id)
+    )
+    backend.release_expired_handoff_leases = lambda: (
+        AscendPDBackend.release_expired_handoff_leases(backend)
     )
 
     return backend
@@ -560,12 +591,12 @@ class TestAscendPDBackend:
         backend = _make_pd_backend_stub()
         mock_obj = _make_mock_mem_obj()
         backend.allocate = MagicMock(return_value=mock_obj)
-        backend.put = MagicMock()
         backend.transfer_channel.batched_read = MagicMock(return_value=1)
         backend._send_pull_done_to_sender = MagicMock()
 
         msg = PullReadyNotif(
             pull_id="pull_eager_1",
+            handoff_id="handoff_eager_1",
             keys=[_make_key("k1").to_string()],
             sender_buffer_uuids=["suuid-1"],
             sender_mem_indexes=[0],
@@ -589,7 +620,11 @@ class TestAscendPDBackend:
         assert ack.alloc_failed is False
         assert ack.already_sent_indexes == []
         backend.transfer_channel.batched_read.assert_called_once()
-        backend.put.assert_called_once()
+        key = _make_key("k1")
+        assert backend._pd_entries[key].base_obj is mock_obj
+        assert backend._pd_entries[key].owners == {
+            "__lmcache_pd_handoff__:handoff_eager_1"
+        }
 
         # Post-ack callback sends Done signal
         assert post_ack_fn is not None
@@ -611,6 +646,7 @@ class TestAscendPDBackend:
 
         msg = PullReadyNotif(
             pull_id="pull_fail",
+            handoff_id="handoff_fail",
             keys=[_make_key("k1").to_string()],
             sender_buffer_uuids=["suuid-1"],
             sender_mem_indexes=[0],
@@ -649,11 +685,11 @@ class TestAscendPDBackend:
             pull_mode=True,
             use_cpu_offload=True,
         )
-        backend.put = MagicMock()
         backend._send_pull_done_to_sender = MagicMock()
 
         msg = PullReadyNotif(
             pull_id="pull_delay_1",
+            handoff_id="handoff_delay_1",
             keys=[_make_key("k1").to_string(), _make_key("k2").to_string()],
             sender_buffer_uuids=["suuid-0", "suuid-1"],
             sender_mem_indexes=[0, 1],
@@ -672,11 +708,10 @@ class TestAscendPDBackend:
         assert isinstance(ack, PullReadyDoneAck)
         assert ack.alloc_failed is False
         assert post_ack_fn is None
-        # Two ProxyMemoryObjs should have been put()
-        assert backend.put.call_count == 2
-        for call in backend.put.call_args_list:
-            _, mem_obj = call.args
-            assert isinstance(mem_obj, ProxyMemoryObj)
+        assert len(backend._pd_entries) == 2
+        for entry in backend._pd_entries.values():
+            assert isinstance(entry.base_obj, ProxyMemoryObj)
+            assert entry.owners == {"__lmcache_pd_handoff__:handoff_delay_1"}
 
     def test_pull_delay_transfer_context_done_callback_is_idempotent(self):
         """Delay-pull transfer context sends done signal at most once."""
@@ -694,11 +729,11 @@ class TestAscendPDBackend:
             pull_mode=True,
             use_cpu_offload=True,
         )
-        backend.put = MagicMock()
         backend._send_pull_done_to_sender = MagicMock()
 
         msg = PullReadyNotif(
             pull_id="pull_delay_done_once",
+            handoff_id="handoff_delay_done_once",
             keys=[_make_key("k1").to_string()],
             sender_buffer_uuids=["suuid-0"],
             sender_mem_indexes=[0],
@@ -715,17 +750,68 @@ class TestAscendPDBackend:
         )
         assert isinstance(ack, PullReadyDoneAck)
         assert post_ack_fn is None
-        assert backend.put.call_count == 1
+        assert len(backend._pd_entries) == 1
 
-        proxy_obj = backend.put.call_args.args[1]
+        proxy_obj = next(iter(backend._pd_entries.values())).base_obj
         assert isinstance(proxy_obj, ProxyMemoryObj)
 
         transfer_ctx = proxy_obj.transfer_context
+        backend.release_handoff_lease("handoff_delay_done_once")
         transfer_ctx.send_done_now()
         transfer_ctx.send_done_now()
         backend._send_pull_done_to_sender.assert_called_once_with(
             "sender_1", "pull_delay_done_once"
         )
+
+    def test_partition_keys_with_handoff_reserves_existing_hit(self):
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.backend import AscendPDBackend
+
+        backend = _make_pd_backend_stub()
+        key = _make_key("shared_handoff_hit")
+        mem_obj = _make_mock_mem_obj()
+        AscendPDBackend.put(backend, key, mem_obj)
+
+        already_indexes, already_objs, new_indexes = (
+            backend._partition_keys_with_handoff([key.to_string()], "shared-handoff")
+        )
+
+        assert already_indexes == [0]
+        assert already_objs == [mem_obj]
+        assert new_indexes == []
+        assert backend._pd_entries[key].owners == {
+            "__lmcache_pd_handoff__:shared-handoff"
+        }
+        assert "__lmcache_pd_handoff__:shared-handoff" in (
+            backend._pd_handoff_deadlines
+        )
+
+    def test_pull_ready_without_handoff_id_returns_typed_failure(self):
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.receiver_mixin import (
+            AscendPDReceiverMixin,
+        )
+
+        backend = _make_pd_backend_stub(pull_mode=True)
+        msg = PullReadyNotif(
+            pull_id="pull_without_handoff",
+            keys=[_make_key("missing_handoff").to_string()],
+            sender_buffer_uuids=["suuid-0"],
+            sender_mem_indexes=[0],
+            sender_id="sender_1",
+            sender_done_url="tcp://sender:9999",
+            fmt=MemoryFormat.KV_2LTD.value,
+            shape=list(DEFAULT_SHAPE),
+            dtype="bfloat16",
+            last_chunk_toks=256,
+        )
+
+        ack, post_ack_fn = AscendPDReceiverMixin._handle_pull_ready(
+            backend, msg, "sender_1"
+        )
+
+        assert ack == PullReadyDoneAck(already_sent_indexes=[], alloc_failed=True)
+        assert post_ack_fn is None
 
     def test_proxy_submit_resolve_batch_fallback_uses_sync_batched_read(self):
         """No submit_batched_read: fallback uses synchronous batched_read."""

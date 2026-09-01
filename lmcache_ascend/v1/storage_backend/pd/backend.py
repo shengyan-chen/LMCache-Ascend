@@ -11,6 +11,7 @@ allocation, and key lookup/partitioning.
 from dataclasses import dataclass, field
 from typing import Optional, Union
 import threading
+import time
 
 # Third Party
 from lmcache.integration.vllm.utils import get_size_bytes
@@ -32,6 +33,9 @@ import zmq
 # First Party
 from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
 from lmcache_ascend.v1.rpc_utils import _find_free_port
+from lmcache_ascend.v1.storage_backend.pd.handoff import (
+    make_pd_handoff_lease_id,
+)
 from lmcache_ascend.v1.storage_backend.pd.receiver_mixin import AscendPDReceiverMixin
 from lmcache_ascend.v1.storage_backend.pd.sender_mixin import AscendPDSenderMixin
 from lmcache_ascend.v1.storage_backend.utils import resolve_memory_format
@@ -87,6 +91,12 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
         self.data: dict[CacheEngineKey, MemoryObj] = {}
         self._pd_entries: dict[CacheEngineKey, PDEntry] = {}
         self._pd_request_keys: dict[str, set[CacheEngineKey]] = {}
+        self._pd_handoff_deadlines: dict[str, float] = {}
+        self._pd_handoff_lease_ttl = float(
+            getattr(config, "pd_handoff_lease_ttl", 300.0)
+        )
+        if self._pd_handoff_lease_ttl <= 0:
+            raise ValueError("pd_handoff_lease_ttl must be greater than zero")
         self.data_lock = threading.Lock()
 
         self.memory_allocator = self.initialize_allocator(config, metadata)
@@ -413,30 +423,128 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
         key: CacheEngineKey,
         entry: PDEntry,
         request_id: str,
-    ) -> None:
+    ) -> bool:
+        """Acquire one key lease while ``data_lock`` is held."""
+        if request_id in entry.owners:
+            return False
+
+        request_proxy = None
+        base_obj = entry.base_obj
+        if isinstance(base_obj, ProxyMemoryObj):
+            request_proxy = base_obj.clone_for_request(request_id)
+            acquire_request = getattr(
+                base_obj.transfer_context,
+                "acquire_request",
+                None,
+            )
+            if callable(acquire_request):
+                acquire_request(request_id)
+
         entry.owners.add(request_id)
         self._pd_request_keys.setdefault(request_id, set()).add(key)
+        if request_proxy is not None:
+            entry.proxy_leases[request_id] = request_proxy
+        return True
 
-        base_obj = entry.base_obj
-        if not isinstance(base_obj, ProxyMemoryObj):
-            return
+    @staticmethod
+    def _release_context_leases(transfer_contexts, request_id: str) -> None:
+        for transfer_context in transfer_contexts:
+            release_request = getattr(
+                transfer_context,
+                "release_request",
+                None,
+            )
+            if callable(release_request):
+                try:
+                    release_request(request_id)
+                except Exception as e:
+                    logger.error(
+                        "Failed to release PD context lease for request %s: %s",
+                        request_id,
+                        e,
+                    )
 
-        if request_id in entry.proxy_leases:
-            return
-
-        entry.proxy_leases[request_id] = base_obj.clone_for_request(request_id)
-        transfer_context = base_obj.transfer_context
-        acquire_request = getattr(
-            transfer_context,
-            "acquire_request",
-            None,
+    def _refresh_handoff_deadline_locked(self, lease_id: str) -> None:
+        self._pd_handoff_deadlines[lease_id] = (
+            time.monotonic() + self._pd_handoff_lease_ttl
         )
-        if callable(acquire_request):
-            acquire_request(request_id)
 
-    def release_request_lease(self, request_id: str) -> None:
+    def put_with_handoff_lease(
+        self,
+        key: CacheEngineKey,
+        mem_obj: MemoryObj,
+        handoff_id: str,
+    ) -> tuple[bool, Optional[MemoryObj]]:
+        """Atomically publish a received object with its temporary owner.
+
+        Returns ``(True, None)`` when ``mem_obj`` was inserted. If another
+        thread populated the key, its object is leased, pinned, and returned.
+        """
+        lease_id = make_pd_handoff_lease_id(handoff_id)
+        with self.data_lock:
+            existing = self._pd_entries.get(key)
+            if existing is not None:
+                base_obj = existing.base_obj
+                if isinstance(base_obj, ProxyMemoryObj) and base_obj.consumed:
+                    self._delete_pd_entry_locked(key, existing, release_obj=False)
+                    existing = None
+
+            if existing is not None:
+                self._ensure_request_lease_locked(key, existing, lease_id)
+                existing.base_obj.ref_count_up()
+                self._refresh_handoff_deadline_locked(lease_id)
+                return False, existing.base_obj
+
+            entry = PDEntry(base_obj=mem_obj)
+            self._ensure_request_lease_locked(key, entry, lease_id)
+            self.data[key] = mem_obj
+            self._pd_entries[key] = entry
+            self._refresh_handoff_deadline_locked(lease_id)
+            return True, None
+
+    def release_expired_handoff_leases(self) -> int:
+        """Release PullReady handoffs whose decoder request never arrived."""
+        now = time.monotonic()
+        with self.data_lock:
+            expired = [
+                (lease_id, deadline)
+                for lease_id, deadline in self._pd_handoff_deadlines.items()
+                if deadline <= now
+            ]
+
+        released = 0
+        for lease_id, deadline in expired:
+            if self.release_request_lease(
+                lease_id,
+                expected_handoff_deadline=deadline,
+            ):
+                released += 1
+                logger.warning(
+                    "Expired unclaimed PD handoff lease: rank=%s lease=%s",
+                    self.tp_rank,
+                    lease_id,
+                )
+        return released
+
+    def release_handoff_lease(self, handoff_id: str) -> bool:
+        """Release one synthetic owner by its logical handoff ID."""
+        return self.release_request_lease(make_pd_handoff_lease_id(handoff_id))
+
+    def release_request_lease(
+        self,
+        request_id: str,
+        expected_handoff_deadline: Optional[float] = None,
+    ) -> bool:
         proxy_contexts = []
         with self.data_lock:
+            if expected_handoff_deadline is not None:
+                current_deadline = self._pd_handoff_deadlines.get(request_id)
+                if (
+                    current_deadline != expected_handoff_deadline
+                    or current_deadline > time.monotonic()
+                ):
+                    return False
+            self._pd_handoff_deadlines.pop(request_id, None)
             keys = self._pd_request_keys.pop(request_id, set())
             for key in list(keys):
                 entry = self._pd_entries.get(key)
@@ -452,14 +560,8 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
                 if not entry.owners:
                     self._delete_pd_entry_locked(key, entry, release_obj=True)
 
-        for transfer_context in proxy_contexts:
-            release_request = getattr(
-                transfer_context,
-                "release_request",
-                None,
-            )
-            if callable(release_request):
-                release_request(request_id)
+        self._release_context_leases(proxy_contexts, request_id)
+        return bool(keys)
 
     def remove(
         self,
@@ -492,6 +594,7 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
                 owned_keys.discard(key)
                 if not owned_keys:
                     self._pd_request_keys.pop(owner, None)
+                    self._pd_handoff_deadlines.pop(owner, None)
         entry.owners.clear()
         entry.proxy_leases.clear()
 
@@ -532,4 +635,45 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
                 already_sent_objs.append(pinned)
             else:
                 new_indexes.append(idx)
+        return already_sent_indexes, already_sent_objs, new_indexes
+
+    def _partition_keys_with_handoff(
+        self,
+        keys: list[str],
+        handoff_id: str,
+    ) -> tuple[list[int], list[MemoryObj], list[int]]:
+        """Partition keys and reserve every existing hit before acknowledgement."""
+        lease_id = make_pd_handoff_lease_id(handoff_id)
+        already_sent_indexes: list[int] = []
+        already_sent_objs: list[MemoryObj] = []
+        new_indexes: list[int] = []
+
+        try:
+            with self.data_lock:
+                for idx, key_str in enumerate(keys):
+                    key = CacheEngineKey.from_string(key_str)
+                    entry = self._pd_entries.get(key)
+                    if entry is None:
+                        new_indexes.append(idx)
+                        continue
+
+                    base_obj = entry.base_obj
+                    if isinstance(base_obj, ProxyMemoryObj) and base_obj.consumed:
+                        self._delete_pd_entry_locked(key, entry, release_obj=False)
+                        new_indexes.append(idx)
+                        continue
+
+                    self._ensure_request_lease_locked(key, entry, lease_id)
+                    base_obj.ref_count_up()
+                    already_sent_indexes.append(idx)
+                    already_sent_objs.append(base_obj)
+
+                if already_sent_indexes:
+                    self._refresh_handoff_deadline_locked(lease_id)
+        except Exception:
+            for mem_obj in already_sent_objs:
+                mem_obj.ref_count_down()
+            self.release_request_lease(lease_id)
+            raise
+
         return already_sent_indexes, already_sent_objs, new_indexes
