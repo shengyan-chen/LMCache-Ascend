@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 import threading
+import time
 
 # Third Party
 from lmcache.utils import CacheEngineKey
@@ -23,6 +24,7 @@ from lmcache_ascend.v1.cache_engine import AscendLMCacheEngine
 from lmcache_ascend.v1.storage_backend import storage_manager as sm
 from lmcache_ascend.v1.storage_backend.pd import receiver_mixin
 from lmcache_ascend.v1.storage_backend.pd.backend import AscendPDBackend
+from lmcache_ascend.v1.storage_backend.pd.handoff import make_pd_handoff_lease_id
 from lmcache_ascend.v1.storage_backend.pd.messages import PullReadyNotif
 
 DTYPES = [torch.bfloat16, torch.float32]
@@ -55,6 +57,22 @@ def _memory_obj(fill=0):
 
 def _key(index):
     return CacheEngineKey("multi-group", 1, 0, index, torch.bfloat16, None)
+
+
+def _pull_message(keys):
+    return PullReadyNotif(
+        pull_id="pull-1",
+        handoff_id="handoff-1",
+        keys=[key.to_string() for key in keys],
+        sender_buffer_uuids=[f"buffer-{i}" for i in range(len(keys))],
+        sender_mem_indexes=list(range(10, 10 + len(keys))),
+        sender_id="sender-1",
+        sender_done_url="tcp://localhost:9901",
+        fmt=FMT.value,
+        shape=list(_shapes()[0]),
+        dtype="bfloat16",
+        last_chunk_toks=4,
+    )
 
 
 def _backend():
@@ -145,19 +163,7 @@ def test_multi_group_shared_entry_releases_all_groups_after_last_request():
 def test_multi_group_delay_pull_clones_keep_partial_layout_and_request_ownership():
     backend = _backend()
     keys = [_key(0), _key(1)]
-    message = PullReadyNotif(
-        pull_id="pull-1",
-        handoff_id="handoff-1",
-        keys=[key.to_string() for key in keys],
-        sender_buffer_uuids=["buffer-0", "buffer-1"],
-        sender_mem_indexes=[10, 11],
-        sender_id="sender-1",
-        sender_done_url="tcp://localhost:9901",
-        fmt=FMT.value,
-        shape=list(_shapes()[0]),
-        dtype="bfloat16",
-        last_chunk_toks=4,
-    )
+    message = _pull_message(keys)
     ack, callback = backend._handle_pull_delay(message, "sender-1")
     assert ack.already_sent_indexes == []
     assert callback is None
@@ -167,10 +173,12 @@ def test_multi_group_delay_pull_clones_keep_partial_layout_and_request_ownership
     assert context._active_lease_count == 2
 
     # #274: temporary deduplication pins must not consume the prototype.
+    # get_ref_count() is an upstream-compatibility facade that always returns 1.
     pinned = backend._contains_and_pin(keys[0])
-    assert pinned.get_ref_count() == 2
+    assert pinned._ref_count == 2
     pinned.ref_count_down()
-    assert pinned.get_ref_count() == 1
+    assert pinned._ref_count == 1
+    assert not pinned._released and not pinned.consumed
     backend._send_pull_done_to_sender.assert_not_called()
 
     assert backend.promote_handoff_lease(message.handoff_id, "req-1") == 2
@@ -216,6 +224,60 @@ def test_multi_group_delay_pull_clones_keep_partial_layout_and_request_ownership
     backend._send_pull_done_to_sender.assert_called_once()
 
 
+def test_multi_group_delay_pull_unclaimed_handoff_expires_once():
+    backend = _backend()
+    keys = [_key(0), _key(1)]
+    message = _pull_message(keys)
+    ack, callback = backend._handle_pull_delay(message, "sender-1")
+    assert not ack.alloc_failed
+    assert callback is None
+    prototypes = [backend.data[key] for key in keys]
+    context = prototypes[0].transfer_context
+    assert context._active_lease_count == 2
+    backend._send_pull_done_to_sender.assert_not_called()
+    lease_id = make_pd_handoff_lease_id(message.handoff_id)
+    backend._pd_handoff_deadlines[lease_id] = time.monotonic() - 1
+
+    assert backend.release_expired_handoff_leases() == 1
+    assert backend.release_expired_handoff_leases() == 0
+    assert backend.promote_handoff_lease(message.handoff_id, "late-request") == 0
+    assert context._active_lease_count == 0
+    assert all(proxy._ref_count == 0 and proxy._released for proxy in prototypes)
+    assert backend.data == backend._pd_entries == backend._pd_request_keys == {}
+    assert backend._pd_handoff_deadlines == {}
+    backend._send_pull_done_to_sender.assert_called_once_with("sender-1", "pull-1")
+
+
+def test_multi_group_delay_pull_publish_failure_releases_all_proxies():
+    backend = _backend()
+    message = _pull_message([_key(0), _key(1)])
+    publish = backend.put_with_handoff_lease
+    proxies = []
+
+    def fail_second_publish(key, proxy, handoff_id):
+        proxies.append(proxy)
+        if len(proxies) == 2:
+            raise RuntimeError("publish failed")
+        return publish(key, proxy, handoff_id)
+
+    with patch.object(
+        backend, "put_with_handoff_lease", side_effect=fail_second_publish
+    ):
+        ack, callback = backend._handle_pull_delay(message, "sender-1")
+
+    assert ack.alloc_failed
+    assert callback is None
+    assert len(proxies) == 2
+    for index, proxy in enumerate(proxies):
+        assert proxy.get_shapes() == _shapes(8 if index == 0 else 4)
+        assert proxy.get_dtypes() == DTYPES
+        assert proxy._ref_count == 0 and proxy._released
+    assert proxies[0].transfer_context._active_lease_count == 0
+    assert backend.data == backend._pd_entries == backend._pd_request_keys == {}
+    assert backend._pd_handoff_deadlines == {}
+    backend._send_pull_done_to_sender.assert_called_once_with("sender-1", "pull-1")
+
+
 def test_multi_group_push_rollback_clears_new_entries_and_releases_existing_pin():
     backend = _backend()
     keys = [_key(i) for i in range(3)]
@@ -246,21 +308,29 @@ def test_multi_group_push_rollback_clears_new_entries_and_releases_existing_pin(
 
 @pytest.mark.parametrize("pd_receiver", [False, True])
 @pytest.mark.parametrize("fails", [False, True])
+@pytest.mark.parametrize("handoff", [False, True])
 def test_retrieve_forwards_group_mappings_and_restores_request_context(
-    pd_receiver, fails
+    pd_receiver, fails, handoff
 ):
     engine = object.__new__(AscendLMCacheEngine)
     engine.config = SimpleNamespace(enable_pd=pd_receiver, pd_role="receiver")
     backend = MagicMock()
     engine.storage_manager = SimpleNamespace(storage_backends={"PDBackend": backend})
+    engine.is_healthy = MagicMock(return_value=True)
     tokens = list(range(8))
     mappings = (torch.arange(8), torch.arange(2))
     result = torch.ones(8, dtype=torch.bool)
+    request_configs = {"lmcache.tag.tenant": "tenant-a"}
+    if handoff:
+        request_configs["lmcache.pd_handoff_id"] = "handoff-1"
 
     def retrieve_impl(actual_tokens, mask=None, **kwargs):
         assert actual_tokens is tokens
         assert kwargs["slot_mappings_by_group"] is mappings
         assert kwargs["slot_mappings_npu_by_group"] is mappings
+        assert kwargs["request_configs"] == {"lmcache.tag.tenant": "tenant-a"}
+        if pd_receiver and handoff:
+            backend.promote_handoff_lease.assert_called_once_with("handoff-1", "req-1")
         assert sm._current_pd_retrieve_id.get() == ("req-1" if pd_receiver else "outer")
         if fails:
             raise RuntimeError("retrieve failed")
@@ -271,6 +341,7 @@ def test_retrieve_forwards_group_mappings_and_restores_request_context(
     try:
         kwargs = dict(
             req_id="req-1",
+            request_configs=request_configs,
             slot_mappings_by_group=mappings,
             slot_mappings_npu_by_group=mappings,
         )
@@ -286,3 +357,6 @@ def test_retrieve_forwards_group_mappings_and_restores_request_context(
         backend.release_request_lease.assert_called_once_with("req-1")
     else:
         backend.release_request_lease.assert_not_called()
+    assert ("lmcache.pd_handoff_id" in request_configs) is handoff
+    if not (pd_receiver and handoff):
+        backend.promote_handoff_lease.assert_not_called()
