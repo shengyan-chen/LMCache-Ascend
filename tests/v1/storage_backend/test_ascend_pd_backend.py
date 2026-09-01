@@ -23,6 +23,7 @@ from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata
 from lmcache.v1.storage_backend.pd_backend import AllocRequest
 import msgspec
+import pytest
 import torch
 
 # First Party
@@ -199,6 +200,7 @@ class TestAscendPDBackend:
                 shape=list(DEFAULT_SHAPE),
                 dtype="bfloat16",
                 last_chunk_toks=256,
+                handoff_id="handoff_1",
             ),
             PullReadyDoneAck(
                 already_sent_indexes=[],
@@ -210,6 +212,7 @@ class TestAscendPDBackend:
             encoded = msgspec.msgpack.encode(msg)
             decoded = msgspec.msgpack.decode(encoded, type=AscendPDMsg)
             assert type(decoded) is type(msg)
+            assert decoded == msg
 
     def test_allocate_receiver_uses_gpu(self):
         """Receiver allocates on GPU (NPU)."""
@@ -817,6 +820,75 @@ class TestAscendPDBackend:
         backend._remote_allocate.assert_not_called()
         # Should still send proxy notification for last prefill
         backend.proxy_side_channel.send.assert_called_once()
+
+    def test_pull_sender_propagates_logical_handoff_id(self):
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.sender_mixin import (
+            AscendPDSenderMixin,
+        )
+
+        backend = _make_pd_backend_stub(role="sender", pull_mode=True)
+        backend.tp_rank = 0
+        backend.local_id = "prefiller_7700"
+        backend._wait_for_backpressure = MagicMock()
+        backend._ensure_peer_connection = MagicMock()
+        backend._sender_done_url = "tcp://sender:9999"
+        backend._pull_pending = {}
+        backend._early_pull_done = set()
+        backend._pull_pending_lock = threading.Lock()
+        backend._pull_pending_pinned_count = 0
+        backend._pull_pending_ttl = 360.0
+        backend.proxy_side_channel = MagicMock()
+
+        side_channel = MagicMock()
+        side_channel.recv.return_value = msgspec.msgpack.encode(
+            PullReadyDoneAck(already_sent_indexes=[0])
+        )
+        backend.mem_alloc_sockets = {"decoder_7710": side_channel}
+        backend.transfer_channel.get_local_buffer_refs.return_value = (
+            ["sender-uuid"],
+            [7],
+        )
+
+        transfer_spec = MagicMock()
+        transfer_spec.req_id = "logical-handoff-123"
+        transfer_spec.receiver_host = "decoder_"
+        transfer_spec.receiver_init_port = [7710]
+        transfer_spec.receiver_alloc_port = [7810]
+        transfer_spec.is_last_prefill = False
+
+        AscendPDSenderMixin._batched_submit_put_task_pull(
+            backend,
+            [_make_key("sender-propagation")],
+            [_make_mock_mem_obj()],
+            transfer_spec,
+        )
+
+        encoded = side_channel.send.call_args.args[0]
+        decoded = msgspec.msgpack.decode(encoded, type=AscendPDMsg)
+        assert isinstance(decoded, PullReadyNotif)
+        assert decoded.handoff_id == "logical-handoff-123"
+
+    def test_pull_sender_rejects_empty_handoff_before_pinning(self):
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.sender_mixin import (
+            AscendPDSenderMixin,
+        )
+
+        backend = _make_pd_backend_stub(role="sender", pull_mode=True)
+        transfer_spec = MagicMock()
+        transfer_spec.req_id = ""
+        mem_obj = _make_mock_mem_obj()
+
+        with pytest.raises(ValueError, match="req_id must not be empty"):
+            AscendPDSenderMixin._batched_submit_put_task_pull(
+                backend,
+                [_make_key("empty-handoff")],
+                [mem_obj],
+                transfer_spec,
+            )
+
+        mem_obj.ref_count_up.assert_not_called()
 
     def test_handle_pull_done_releases_resources(self):
         """_handle_pull_done releases pinned MemObjs."""
