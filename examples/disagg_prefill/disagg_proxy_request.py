@@ -61,6 +61,8 @@ def parse_chat_render_output(
 def build_chat_phase_requests(
     request_data: dict[str, Any],
     prompt_token_ids: list[int],
+    *,
+    handoff_id: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build an internal prefill request and a native Chat decode request."""
     prefill_request = request_data.copy()
@@ -71,6 +73,9 @@ def build_chat_phase_requests(
     prefill_request["stream"] = False
 
     decode_request = request_data.copy()
+    decode_request["kv_transfer_params"] = {
+        "lmcache.pd_handoff_id": handoff_id,
+    }
 
     return prefill_request, decode_request
 

@@ -173,12 +173,14 @@ def test_multi_group_delay_pull_clones_keep_partial_layout_and_request_ownership
     assert pinned.get_ref_count() == 1
     backend._send_pull_done_to_sender.assert_not_called()
 
+    assert backend.promote_handoff_lease(message.handoff_id, "req-1") == 2
+    assert backend.promote_handoff_lease(message.handoff_id, "req-1") == 0
+    assert backend._pd_handoff_deadlines == {}
+    assert context._active_lease_count == 2
+    backend._send_pull_done_to_sender.assert_not_called()
     for request in ("req-1", "req-2"):
         assert backend.batched_contains_and_lease(keys, request) == 2
         assert backend.batched_contains_and_lease(keys, request) == 2
-    assert context._active_lease_count == 6
-    backend.release_handoff_lease(message.handoff_id)
-    assert backend._pd_handoff_deadlines == {}
     assert context._active_lease_count == 4
     first = backend.batched_get_blocking_for_request(keys, "req-1")
     second = backend.batched_get_blocking_for_request(keys, "req-2")

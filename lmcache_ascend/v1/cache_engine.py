@@ -29,6 +29,9 @@ import torch
 # First Party
 from lmcache_ascend.v1.memory_management import is_multi_group_memory_obj
 from lmcache_ascend.v1.state_cache import StateCache
+from lmcache_ascend.v1.storage_backend.pd.handoff import (
+    split_pd_handoff_request_config,
+)
 
 logger = init_logger(__name__)
 
@@ -141,6 +144,33 @@ class AscendLMCacheEngine(LMCacheEngine):
         release_request_lease = getattr(pd_backend, "release_request_lease", None)
         if callable(release_request_lease):
             release_request_lease(request_id)
+
+    def _promote_pd_handoff_lease(
+        self,
+        handoff_id: Optional[str],
+        request_id: Optional[str],
+    ) -> None:
+        if not handoff_id or not request_id or request_id == "unspecified":
+            return
+        if not self.is_healthy():
+            return
+
+        storage_manager = getattr(self, "storage_manager", None)
+        if not self._is_pd_receiver() or storage_manager is None:
+            return
+
+        pd_backend = storage_manager.storage_backends.get("PDBackend")
+        promote_handoff_lease = getattr(pd_backend, "promote_handoff_lease", None)
+        if callable(promote_handoff_lease):
+            promote_handoff_lease(handoff_id, request_id)
+
+    @staticmethod
+    def _extract_pd_handoff_from_kwargs(kwargs: dict) -> Optional[str]:
+        request_configs = kwargs.get("request_configs")
+        handoff_id, sanitized = split_pd_handoff_request_config(request_configs)
+        if sanitized is not request_configs:
+            kwargs["request_configs"] = sanitized
+        return handoff_id
 
     def _ensure_store_worker(self) -> None:
         if self._store_queue is not None:
@@ -1119,6 +1149,7 @@ class AscendLMCacheEngine(LMCacheEngine):
         pin: bool = False,
         request_configs: Optional[dict] = None,
     ) -> int:
+        handoff_id, request_configs = split_pd_handoff_request_config(request_configs)
         # Serialize against the store-worker thread's
         with self._engine_state_lock:
             # First Party
@@ -1136,6 +1167,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                     hashes=hashes,
                     offsets=offsets,
                 )
+            if pin:
+                self._promote_pd_handoff_lease(handoff_id, lookup_id)
             token = None
             if self._is_pd_receiver() and pin and lookup_id is not None:
                 # First Party
@@ -1181,7 +1214,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        handoff_id = self._extract_pd_handoff_from_kwargs(kwargs)
         req_id = self._get_req_id(kwargs)
+        self._promote_pd_handoff_lease(handoff_id, req_id)
         token = None
         if self._is_pd_receiver():
             # First Party
@@ -1268,6 +1303,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+        # Handoff metadata is control-plane state, not a cache namespace.
+        self._extract_pd_handoff_from_kwargs(kwargs)
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store operation")
