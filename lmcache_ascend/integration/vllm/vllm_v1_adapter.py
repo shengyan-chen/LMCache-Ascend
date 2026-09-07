@@ -1052,7 +1052,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
         )
 
     def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
-        if self.lmcache_engine is None:
+        if self.lmcache_engine is None or not preempted_req_ids:
             return
 
         logger.debug(
