@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -23,9 +24,16 @@ import torch
 if TYPE_CHECKING:
     # Third Party
     from vllm.forward_context import ForwardContext
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class AscendConnectorMetadata(LMCacheConnectorMetadata):
+    # Preemptions must be delivered even when no load/store request is scheduled.
+    preempted_req_ids: set[str] = field(default_factory=set)
 
 
 class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
@@ -42,6 +50,19 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._finished_req_ids_waiting_for_save: set[str] = set()
         self._late_finished_sending: set[str] = set()
         logger.debug("store_async: %s", self.store_async)
+
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> AscendConnectorMetadata:
+        """Carry scheduler preemptions alongside the upstream load/store payload."""
+        preempted_req_ids = set(
+            getattr(scheduler_output, "preempted_req_ids", None) or ()
+        )
+        metadata = super().build_connector_meta(scheduler_output)
+        return AscendConnectorMetadata(
+            requests=metadata.requests,
+            preempted_req_ids=preempted_req_ids,
+        )
 
     def _apply_extra_config(self, config, vllm_config: "VllmConfig") -> None:
         """Apply vLLM extra config, then reject unsupported combinations.

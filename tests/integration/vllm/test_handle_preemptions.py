@@ -102,3 +102,72 @@ def test_ascend_adapter_skips_preemption_drain_when_not_required(
 
     if has_engine:
         lmcache_engine.wait_for_pending_stores.assert_not_called()
+
+
+@pytest.mark.parametrize("preempted", [None, set(), {"req-1"}])
+@pytest.mark.parametrize("store_async", [False, True])
+@pytest.mark.parametrize("kv_role", ["kv_both", "kv_consumer"])
+def test_scheduler_metadata_drives_worker_preemption_cleanup(
+    preempted, store_async, kv_role
+):
+    """vLLM 0.23 metadata must preserve IDs and reach the real worker hook."""
+    # Standard
+    import pickle
+
+    LMCacheConnectorV1 = _import_and_patch_vllm_connector()
+    adapter_mod = pytest.importorskip("lmcache_ascend.integration.vllm.vllm_v1_adapter")
+    scheduler = _make_adapter(
+        adapter_mod, store_async=store_async, kv_role=kv_role, lmcache_engine=None
+    )
+    scheduler.force_skip_save = False
+    output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        preempted_req_ids=None if preempted is None else set(preempted),
+    )
+    metadata = scheduler.build_connector_meta(output)
+    assert metadata.preempted_req_ids == (preempted or set())
+    if output.preempted_req_ids is not None:
+        output.preempted_req_ids.add("later")
+        assert "later" not in metadata.preempted_req_ids
+    metadata = pickle.loads(pickle.dumps(metadata))
+
+    engine = MagicMock()
+    engine.wait_for_pending_stores.return_value = set()
+    worker = _make_adapter(
+        adapter_mod, store_async=store_async, kv_role=kv_role, lmcache_engine=engine
+    )
+    connector = object.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = worker
+    connector.handle_preemptions(metadata)
+
+    if preempted:
+        engine.lookup_unpin.assert_called_once_with("req-1")
+    else:
+        engine.lookup_unpin.assert_not_called()
+    if preempted and store_async and kv_role != "kv_consumer":
+        engine.wait_for_pending_stores.assert_called_once_with({"req-1"})
+    else:
+        engine.wait_for_pending_stores.assert_not_called()
+
+
+def test_preemption_metadata_keeps_upstream_request_payload(monkeypatch):
+    """Adding preemption IDs must not discard load/store request metadata."""
+    _import_and_patch_vllm_connector()
+    adapter_mod = pytest.importorskip("lmcache_ascend.integration.vllm.vllm_v1_adapter")
+    requests = [SimpleNamespace(req_id="req-to-load")]
+    upstream_metadata = adapter_mod.LMCacheConnectorMetadata(requests=requests)
+    monkeypatch.setattr(
+        adapter_mod.LMCacheConnectorV1Impl,
+        "build_connector_meta",
+        lambda self, output: upstream_metadata,
+    )
+    scheduler = _make_adapter(
+        adapter_mod, store_async=True, kv_role="kv_both", lmcache_engine=None
+    )
+    # Older schedulers may not provide a preempted_req_ids attribute.
+    metadata = scheduler.build_connector_meta(SimpleNamespace())
+    assert isinstance(metadata, adapter_mod.LMCacheConnectorMetadata)
+    assert metadata.requests is requests
+    assert metadata.preempted_req_ids == set()

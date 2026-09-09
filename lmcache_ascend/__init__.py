@@ -513,12 +513,23 @@ def _patch_vllm_v1_adapter():
 
     # First Party
     from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
+        AscendConnectorMetadata,
+    )
+    from lmcache_ascend.integration.vllm.vllm_v1_adapter import (
         LMCacheAscendConnectorV1Impl as ascend_LMCacheAscendConnectorV1Impl,
     )
 
     lmc_vllm_v1_adapter.LMCacheConnectorV1Impl = ascend_LMCacheAscendConnectorV1Impl
 
-    def handle_preemptions(self, preempted_req_ids):
+    def handle_preemptions(self, kv_connector_metadata):
+        # vLLM 0.23 passes metadata; older callers pass the request-ID set.
+        preempted_req_ids = (
+            kv_connector_metadata.preempted_req_ids
+            if isinstance(kv_connector_metadata, AscendConnectorMetadata)
+            else kv_connector_metadata
+        )
+        if not preempted_req_ids:
+            return
         method = getattr(self._lmcache_engine, "handle_preemptions", None)
         if callable(method):
             method(preempted_req_ids)
