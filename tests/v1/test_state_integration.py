@@ -1104,7 +1104,10 @@ def test_worker_state_copy_error_propagates():
             store_state=Mock(side_effect=RuntimeError("device copy failed")),
         )
     )
-    meta = SimpleNamespace(state_executions=[SimpleNamespace(req_id="r", end=32)])
+    execution = StateExecution(
+        "r", tuple(range(32)), 16, 32, 32, ((), (1, 2)), ((1, 16),), False, True
+    )
+    meta = AscendConnectorMetadata(state_executions=[execution])
     with pytest.raises(RuntimeError, match="device copy failed"):
         worker._save_state_executions(meta, object())
 
