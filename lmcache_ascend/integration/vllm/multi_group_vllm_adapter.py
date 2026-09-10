@@ -396,6 +396,7 @@ class RequestTracker(UpstreamRequestTracker):
         lmcache_cached_tokens: int = 0,
         vllm_cached_tokens: int = 0,
         all_token_ids: Optional[list[int]] = None,
+        state_speculative_blocks: tuple[int, ...] = (),
     ) -> None:
         """Update the request tracker when a running request is scheduled again.
 
@@ -434,10 +435,23 @@ class RequestTracker(UpstreamRequestTracker):
         if preempted:
             self.allocated_block_ids_by_group = new_block_ids_by_group
         else:
+            # MambaManager returns only the appended tail. Moving old spec
+            # blocks into that tail also nulls their old slots, which are not
+            # included in the delta. The tail ends with one newly allocated
+            # block; any preceding entries can contain moved spec blocks.
+            updated_groups = [list(ids) for ids in old_block_ids_by_group]
+            for group, num_spec in enumerate(state_speculative_blocks):
+                delta = new_block_ids_by_group[group]
+                if not num_spec or not delta:
+                    continue
+                old = updated_groups[group]
+                begin = len(old) - num_spec
+                moved = min(len(delta) - 1, num_spec)
+                old[begin : begin + moved] = [0] * moved
             self.allocated_block_ids_by_group = tuple(
                 old_group_ids + new_group_ids
                 for old_group_ids, new_group_ids in zip(
-                    old_block_ids_by_group,
+                    updated_groups,
                     new_block_ids_by_group,
                     strict=True,
                 )
@@ -572,6 +586,7 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
     # and temporarily overridden in record_failed_blocks (per-group block_size).
     _block_size: int
     _state_mtp: bool = False
+    _state_speculative_blocks_by_group: tuple[int, ...] = ()
 
     def __init__(
         self,
@@ -610,6 +625,14 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
         self._state_mtp = (
             primary is not None and vllm_config.speculative_config is not None
         )
+        if primary is not None:
+            self._state_speculative_blocks_by_group = tuple(
+                max(
+                    getattr(spec, "num_speculative_blocks", 0)
+                    for spec in _iter_layer_specs(group.kv_cache_spec)
+                )
+                for group in self._kv_cache_config.kv_cache_groups
+            )
         if self._kv_cache_config is not None and getattr(
             self._kv_cache_config, "kv_cache_groups", None
         ):
@@ -761,6 +784,21 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
         tracker.save_in_current_step = not self._state_mtp or (
             not tracker.is_decode_phase and not drafts and end <= tracker.prompt_len
         )
+        tables = [list(ids) for ids in tracker.allocated_block_ids_by_group]
+        for index, group in enumerate(self._kv_cache_config.kv_cache_groups):
+            if not any(
+                state_group_index(self._kv_cache_config, name) == index
+                for name in group.layer_names
+            ):
+                continue
+            spec = next(_iter_layer_specs(group.kv_cache_spec))
+            # Mirror MambaManager's conservative freeing boundary. Clear before
+            # building either Attention metadata or the state execution snapshot.
+            skipped = max(0, start - spec.num_speculative_blocks - 1) // spec.block_size
+            count = min(skipped, len(tables[index]))
+            tables[index][:count] = [0] * count
+        tracker.allocated_block_ids_by_group = tuple(tables)
+        tracker._sync_primary_allocated_block_ids()
 
     def _attach_state_executions(
         self, meta: AscendConnectorMetadata, output: SchedulerOutput
@@ -801,15 +839,6 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
                 output.scheduled_spec_decode_tokens.get(req_id) and not self._state_mtp
             ):
                 raise ValueError("State execution requires supported text requests")
-            tables = [list(ids) for ids in tracker.allocated_block_ids_by_group]
-            for group, size in state_sizes:
-                # Running SchedulerOutput carries append-only allocation deltas.
-                # MambaManager frees older entries; only the previous running
-                # block and this round's allocation can remain relevant here.
-                previous = max(0, (start - 1) // size)
-                tables[group][:previous] = [0] * min(previous, len(tables[group]))
-            tracker.allocated_block_ids_by_group = tuple(tables)
-            tracker._sync_primary_allocated_block_ids()
             meta.state_executions.append(
                 StateExecution(
                     req_id=req_id,
@@ -821,7 +850,9 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
                         // self._lmcache_chunk_size
                         * self._lmcache_chunk_size
                     ),
-                    block_ids_by_group=tuple(tuple(ids) for ids in tables),
+                    block_ids_by_group=tuple(
+                        tuple(ids) for ids in tracker.allocated_block_ids_by_group
+                    ),
                     state_block_sizes=state_sizes,
                     request_configs=deepcopy(tracker.request_configs),
                     can_load=can_load,
@@ -979,6 +1010,7 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
                     lmcache_cached_tokens=lmcache_cached_tokens,
                     vllm_cached_tokens=vllm_cached_tokens,
                     all_token_ids=all_token_ids,
+                    state_speculative_blocks=self._state_speculative_blocks_by_group,
                 )
 
                 self._apply_allocated_blocks(request_tracker)
@@ -1096,6 +1128,7 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
                 lmcache_cached_tokens=lmcache_cached_tokens,
                 vllm_cached_tokens=vllm_cached_tokens,
                 all_token_ids=all_token_ids,
+                state_speculative_blocks=self._state_speculative_blocks_by_group,
             )
 
             self._apply_allocated_blocks(request_tracker)

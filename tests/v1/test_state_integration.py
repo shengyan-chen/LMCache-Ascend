@@ -722,6 +722,7 @@ def test_raw_execution_survives_attention_clipping_and_no_attention_work(
         num_scheduled_tokens={"r": end - 1024},
         scheduled_spec_decode_tokens={},
     )
+    connector._prepare_state_request(tracker, 1024, output)
     meta = connector._attach_state_executions(AscendConnectorMetadata(), output)
     (execution,) = meta.state_executions
     assert execution.request_configs == {"lmcache.tag.tenant": "tenant-a"}
@@ -816,6 +817,92 @@ def test_non_mtp_decode_save_configuration_is_preserved():
     )
     assert meta.save_spec.can_save
     assert tracker.num_saved_tokens == 2048
+
+
+@pytest.mark.parametrize(
+    "old,delta,num_spec,expected",
+    [
+        ([11, 12, 13], [0, 13, 14], 1, [11, 12, 0, 0, 13, 14]),
+        ([11, 12, 13], [14], 1, [11, 12, 13, 14]),
+        ([11, 12, 13], [], 1, [11, 12, 13]),
+        ([11, 12, 13, 14], [12, 13, 15], 3, [11, 0, 0, 14, 12, 13, 15]),
+        ([11, 12, 13, 14], [0, 12, 13, 14, 15], 3, [11, 0, 0, 0, 0, 12, 13, 14, 15]),
+    ],
+)
+def test_running_state_delta_clears_only_relocated_speculative_slots(
+    old, delta, num_spec, expected
+):
+    tracker = RequestTracker(
+        req_id="r",
+        prompt_len=8192,
+        token_ids=list(range(1024)),
+        allocated_block_ids=[1, 2],
+        allocated_block_ids_by_group=([1, 2], list(old), list(old)),
+    )
+    tracker.update(
+        [7, 8], ([3], delta, delta), state_speculative_blocks=(0, num_spec, num_spec)
+    )
+    assert tracker.allocated_block_ids_by_group == ([1, 2, 3], expected, expected)
+    assert tracker.token_ids[-2:] == [7, 8]
+
+
+def test_full_state_table_replaces_delta_after_speculative_movement():
+    tracker = RequestTracker(
+        req_id="r",
+        prompt_len=4096,
+        token_ids=list(range(1024)),
+        allocated_block_ids=[1, 2],
+        allocated_block_ids_by_group=([1, 2], [11, 12, 13]),
+    )
+    connector = _connector(tracker)
+    connector._allocated_blocks["r"] = ([7, 8], [0, 81, 82])
+    tracker.update([7], ([3], [0, 13, 14]), state_speculative_blocks=(0, 1))
+    connector._apply_allocated_blocks(tracker)
+    assert tracker.allocated_block_ids_by_group == ([7, 8], [0, 81, 82])
+    assert not connector._allocated_blocks
+
+
+def test_mtp_skipped_slots_use_conservative_start_before_metadata():
+    tracker = RequestTracker(
+        req_id="r",
+        prompt_len=4096,
+        token_ids=list(range(2048)),
+        allocated_block_ids=[1, 2, 3],
+        allocated_block_ids_by_group=([1, 2, 3], [11, 12, 13]),
+    )
+    connector = _connector(tracker)
+    connector._state_mtp = True
+    group = connector._kv_cache_config.kv_cache_groups[1]
+    group.kv_cache_spec = replace(
+        group.kv_cache_spec, block_size=1024, num_speculative_blocks=1
+    )
+    output = SimpleNamespace(
+        num_scheduled_tokens={"r": 1}, scheduled_spec_decode_tokens={}
+    )
+    connector._prepare_state_request(tracker, 1025, output)
+    assert tracker.allocated_block_ids_by_group == ([1, 2, 3], [11, 12, 13])
+    connector._prepare_state_request(tracker, 2049, output)
+    assert tracker.allocated_block_ids_by_group == ([1, 2, 3], [0, 12, 13])
+
+
+def test_mtp_preempted_tracker_uses_complete_replacement_table():
+    tracker = RequestTracker(
+        req_id="r",
+        prompt_len=4096,
+        token_ids=list(range(2048)),
+        allocated_block_ids=[1],
+        allocated_block_ids_by_group=([1], [11, 12, 13]),
+    )
+    tracker.update(
+        [7],
+        ([8, 9], [0, 81, 82]),
+        preempted=True,
+        lmcache_cached_tokens=1024,
+        all_token_ids=list(range(4096)),
+        state_speculative_blocks=(0, 1),
+    )
+    assert tracker.allocated_block_ids_by_group == ([8, 9], [0, 81, 82])
+    assert tracker.token_ids == list(range(1025))
 
 
 def test_complete_allocation_replaces_old_attempt_and_is_snapshotted():
