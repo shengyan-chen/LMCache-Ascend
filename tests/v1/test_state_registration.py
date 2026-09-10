@@ -305,12 +305,17 @@ def test_hybrid_rejects_speculative_and_pipeline_parallel(speculative):
 
 @pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
 @pytest.mark.parametrize("state_first", [True, False])
+@pytest.mark.parametrize("enforce_eager", [True, False])
 def test_supported_mtp_registers_actual_attention_and_state(
-    monkeypatch, model_type, state_first
+    monkeypatch, model_type, state_first, enforce_eager
 ):
     connector, tensors = _registration(monkeypatch, state_first)
     connector._vllm_config = _vllm_config(mtp=True)
     connector._vllm_config.model_config.hf_text_config.model_type = model_type
+    connector._vllm_config.model_config.enforce_eager = enforce_eager
+    speculative = connector._vllm_config.speculative_config
+    speculative.draft_model_config.enforce_eager = enforce_eager
+    speculative.enforce_eager = enforce_eager
     for group in connector._kv_cache_config.kv_cache_groups:
         if isinstance(group.kv_cache_spec, MambaSpec):
             group.kv_cache_spec = replace(
@@ -336,16 +341,22 @@ def test_supported_mtp_registers_actual_attention_and_state(
 
 
 @pytest.mark.parametrize(
-    "failure",
-    [
-        "method",
-        "target",
-        "draft",
-        "decode_save",
-        "async",
-        "target_graph",
-        "draft_graph",
-    ],
+    "target_eager,draft_override",
+    [(True, True), (False, None), (False, False), (False, True)],
+)
+def test_mtp_accepts_target_and_draft_execution_options(target_eager, draft_override):
+    config = LMCacheEngineConfig.from_defaults()
+    vllm = _vllm_config(mtp=True)
+    vllm.model_config.enforce_eager = target_eager
+    # The draft model config inherits target eager; the proposer also applies
+    # the speculative override when choosing graph replay for draft execution.
+    vllm.speculative_config.draft_model_config.enforce_eager = target_eager
+    vllm.speculative_config.enforce_eager = draft_override
+    validate_state_config(config, vllm)
+
+
+@pytest.mark.parametrize(
+    "failure", ["method", "target", "draft", "decode_save", "async"]
 )
 def test_mtp_rejects_options_outside_prefill_reuse_contract(failure):
     config = LMCacheEngineConfig.from_defaults()
@@ -360,12 +371,8 @@ def test_mtp_rejects_options_outside_prefill_reuse_contract(failure):
         )
     elif failure == "decode_save":
         config.save_decode_cache = True
-    elif failure == "async":
-        vllm.scheduler_config.async_scheduling = True
-    elif failure == "target_graph":
-        vllm.model_config.enforce_eager = False
     else:
-        vllm.speculative_config.enforce_eager = False
+        vllm.scheduler_config.async_scheduling = True
     with pytest.raises(ValueError, match="MTP|speculative"):
         validate_state_config(config, vllm)
 
