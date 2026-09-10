@@ -5,6 +5,8 @@ Run PR2's native transfer acceptance first. Set QWEN35_TEST_MODEL and explicit
 QWEN35_TEST_TP; remote model/tokenizer identifiers require immutable revisions.
 This ordered flow owns both sequential LLM lifetimes and its private disk cache.
 It does not certify cancellation/preemption or recovery after a partial load.
+Set QWEN35_TEST_MTP=1 to exercise prefill reuse with MTP decode. This normal-path
+flow does not certify the spec-sized short-prefill SSM boundary cases.
 """
 
 # Standard
@@ -134,6 +136,38 @@ def _worker_probe(worker, action):
 
         patch(adapter, "_load_hybrid_request", load)
 
+        if adapter._state_mtp:
+            current_steps = {}
+            original_wait = adapter.wait_for_save
+            original_attention_store = engine.store
+
+            def wait():
+                metadata = adapter._parent._get_connector_metadata()
+                current_steps.clear()
+                for execution in metadata.state_executions:
+                    step = dict(
+                        request=execution.req_id,
+                        start=execution.start,
+                        E=execution.end,
+                        can_save=execution.can_save,
+                    )
+                    current_steps[execution.req_id] = step
+                    trace["events"].append(dict(step, kind="step"))
+                return original_wait()
+
+            def attention_store(tokens, *args, **kwargs):
+                trace["events"].append(
+                    dict(
+                        current_steps[kwargs["req_id"]],
+                        kind="attention_store",
+                        saved_tokens=len(tokens),
+                    )
+                )
+                return original_attention_store(tokens, *args, **kwargs)
+
+            patch(adapter, "wait_for_save", wait)
+            patch(engine, "store", attention_store)
+
         def observe_get(backend, name):
             original = backend.get_blocking
 
@@ -160,6 +194,8 @@ def _worker_probe(worker, action):
             "native": native.__file__,
             "groups": [layout.group_index for layout in adapter.state_layouts],
             "layouts": [repr(layout) for layout in adapter.state_layouts],
+            "attention_layers": list(adapter.kv_caches),
+            "mtp": adapter._state_mtp,
         }
 
     trace = worker._qwen35_e2e
@@ -301,6 +337,19 @@ def qwen35_acceptance(tmp_path, monkeypatch):
         max_model_len=6 * block,
         gpu_memory_utilization=float(os.environ.get("QWEN35_TEST_MEMORY", "0.8")),
     )
+    mtp_tokens = int(os.environ.get("QWEN35_TEST_MTP", "0"))
+    assert mtp_tokens >= 0
+    if mtp_tokens:
+        args.update(
+            speculative_config=dict(
+                method="qwen3_5_mtp",
+                num_speculative_tokens=mtp_tokens,
+                enforce_eager=True,
+            ),
+            async_scheduling=False,
+            disable_hybrid_kv_cache_manager=False,
+            disable_log_stats=False,
+        )
     evidence = {
         "args": args,
         "cache_config": config,
@@ -336,14 +385,16 @@ def test_qwen35_external_state_acceptance(qwen35_acceptance):
     from vllm.config import KVTransferConfig
 
     args, block, evidence = qwen35_acceptance
+    mtp = args.get("speculative_config") is not None
+    output_tokens = int(os.environ.get("QWEN35_TEST_OUTPUT_TOKENS", "8"))
     sampling = SamplingParams(
-        temperature=0, top_p=1, seed=0, max_tokens=8, ignore_eos=True
+        temperature=0, top_p=1, seed=0, max_tokens=output_tokens, ignore_eos=True
     )
     evidence["sampling"] = {
         "temperature": 0,
         "top_p": 1,
         "seed": 0,
-        "max_tokens": 8,
+        "max_tokens": output_tokens,
         "ignore_eos": True,
     }
     baseline = {}
@@ -382,6 +433,18 @@ def test_qwen35_external_state_acceptance(qwen35_acceptance):
         ),
     )
     with _model(cached_args) as llm:
+
+        def mtp_counters():
+            names = (
+                "vllm:spec_decode_num_draft_tokens",
+                "vllm:spec_decode_num_accepted_tokens",
+            )
+            metrics = llm.get_metrics()
+            return {
+                name: sum(m.value for m in metrics if m.name == name) for name in names
+            }
+
+        mtp_before = mtp_counters() if mtp else {}
 
         def rpc(action):
             return llm.collective_rpc(_worker_probe, args=(action,), timeout=60)
@@ -434,6 +497,20 @@ def test_qwen35_external_state_acceptance(qwen35_acceptance):
             for trace in traces:
                 rank, events = trace["rank"], trace["events"]
                 assert trace["engine"] == identities[rank], "LMCache was reset"
+                if mtp:
+                    steps = [e for e in events if e["kind"] == "step"]
+                    assert any(e["start"] >= len(prompt) for e in steps), (
+                        "No decode observed"
+                    )
+                    for step in steps:
+                        if step["start"] >= len(prompt):
+                            assert not step["can_save"], step
+                    for event in events:
+                        if event["kind"] == "attention_store" or (
+                            event["kind"] == "copy" and event["direction"] == "store"
+                        ):
+                            assert event["start"] < len(prompt), event
+                            assert event["E"] <= len(prompt), event
                 restores = [e for e in events if e["kind"] == "restore"]
                 loads = [
                     e
@@ -472,20 +549,24 @@ def test_qwen35_external_state_acceptance(qwen35_acceptance):
         try:
             warm_traces = run("first_save", "warm")
             for trace in warm_traces:
-                # Actual sparse endpoints, never fabricated S(block)/S(3*block).
-                assert {e["R"] for e in trace["events"] if e["kind"] == "copy"} == {
-                    2 * block,
-                    4 * block,
-                }
-            run("full_hit_earlier_checkpoint", "warm", 2 * block)
+                # MTP changes the scheduler's last aligned prefill split.
+                expected = (
+                    {2 * block, 3 * block, 4 * block} if mtp else {2 * block, 4 * block}
+                )
+                assert {
+                    e["R"] for e in trace["events"] if e["kind"] == "copy"
+                } == expected
+            warm_restore = (3 if mtp else 2) * block
+            run("full_hit_earlier_checkpoint", "warm", warm_restore)
             run("distinct_request_shared_prefix", "prefix", 2 * block)
             run("extension", "extension", 4 * block)
             cold_traces = run("isolated_first_save", "cold")
             for trace in cold_traces:
-                assert {e["R"] for e in trace["events"] if e["kind"] == "copy"} == {
-                    2 * block
-                }
-            run("no_earlier_checkpoint_miss", "cold")
+                expected = {block, 2 * block} if mtp else {2 * block}
+                assert {
+                    e["R"] for e in trace["events"] if e["kind"] == "copy"
+                } == expected
+            run("cold_prompt_replay", "cold", block if mtp else None)
 
             # Disk publication is asynchronous even with synchronous state copy.
             # Each worker evicts at most once; polling never resets either engine.
@@ -503,9 +584,16 @@ def test_qwen35_external_state_acceptance(qwen35_acceptance):
             for item in status:
                 assert item["removed"] > 0 and item["cpu_remaining"] == 0
                 assert item["engine"] == identities[item["rank"]]
-            run("disk_after_cpu_eviction", "warm", 2 * block, disk=True)
+            run("disk_after_cpu_eviction", "warm", warm_restore, disk=True)
+            if mtp:
+                mtp_after = mtp_counters()
+                evidence["mtp_counters"] = {"before": mtp_before, "after": mtp_after}
+                assert all(
+                    mtp_after[name] > value for name, value in mtp_before.items()
+                ), "MTP must generate and accept drafts during the cached-model run"
             evidence["acceptance"] = (
-                "normal-path flow passed; fault/lifecycle matrix pending"
+                "normal-path flow passed; "
+                "fault/lifecycle and MTP short-prefill cases pending"
             )
         finally:
             rpc("close")

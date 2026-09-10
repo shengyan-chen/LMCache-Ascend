@@ -103,9 +103,26 @@ def _registration(monkeypatch, state_first=True, merged=False, kernel_block_size
     return connector, tensors
 
 
-def _vllm_config():
+def _vllm_config(mtp=False):
     return SimpleNamespace(
-        speculative_config=None,
+        speculative_config=(
+            SimpleNamespace(
+                method="mtp",
+                num_speculative_tokens=1,
+                enforce_eager=True,
+                draft_model_config=SimpleNamespace(
+                    enforce_eager=True,
+                    hf_config=SimpleNamespace(model_type="qwen3_5_mtp"),
+                ),
+            )
+            if mtp
+            else None
+        ),
+        model_config=SimpleNamespace(
+            enforce_eager=True,
+            hf_text_config=SimpleNamespace(model_type="qwen3_5_moe_text"),
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1, tensor_parallel_size=2
         ),
@@ -284,6 +301,73 @@ def test_hybrid_rejects_speculative_and_pipeline_parallel(speculative):
         config.parallel_config.pipeline_parallel_size = 2
     with pytest.raises(ValueError, match="speculative|pipeline"):
         validate_state_config(LMCacheEngineConfig.from_defaults(), config)
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
+@pytest.mark.parametrize("state_first", [True, False])
+def test_supported_mtp_registers_actual_attention_and_state(
+    monkeypatch, model_type, state_first
+):
+    connector, tensors = _registration(monkeypatch, state_first)
+    connector._vllm_config = _vllm_config(mtp=True)
+    connector._vllm_config.model_config.hf_text_config.model_type = model_type
+    for group in connector._kv_cache_config.kv_cache_groups:
+        if isinstance(group.kv_cache_spec, MambaSpec):
+            group.kv_cache_spec = replace(
+                group.kv_cache_spec, num_speculative_blocks=1, shapes=((1, 4), (2, 2))
+            )
+            for name in group.layer_names:
+                tensors[name] = [
+                    torch.empty(5, 1, 4, dtype=torch.bfloat16),
+                    torch.empty(5, 2, 2),
+                ]
+        else:
+            group.layer_names.append("mtp.attn")
+            tensors["mtp.attn"] = tuple(torch.zeros_like(t) for t in tensors["attn.0"])
+    connector.register_kv_caches(tensors)
+    assert connector.num_layers == 3
+    assert "mtp.attn" in connector.kv_caches
+    assert all(
+        layout.planes[0].shape == (1, 1, 4) for layout in connector.state_layouts
+    )
+    assert all(
+        layout.planes[1].shape == (1, 2, 2) for layout in connector.state_layouts
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "method",
+        "target",
+        "draft",
+        "decode_save",
+        "async",
+        "target_graph",
+        "draft_graph",
+    ],
+)
+def test_mtp_rejects_options_outside_prefill_reuse_contract(failure):
+    config = LMCacheEngineConfig.from_defaults()
+    vllm = _vllm_config(mtp=True)
+    if failure == "method":
+        vllm.speculative_config.method = "eagle3"
+    elif failure == "target":
+        vllm.model_config.hf_text_config.model_type = "qwen3_next"
+    elif failure == "draft":
+        vllm.speculative_config.draft_model_config.hf_config.model_type = (
+            "qwen3_next_mtp"
+        )
+    elif failure == "decode_save":
+        config.save_decode_cache = True
+    elif failure == "async":
+        vllm.scheduler_config.async_scheduling = True
+    elif failure == "target_graph":
+        vllm.model_config.enforce_eager = False
+    else:
+        vllm.speculative_config.enforce_eager = False
+    with pytest.raises(ValueError, match="MTP|speculative"):
+        validate_state_config(config, vllm)
 
 
 @pytest.mark.parametrize("disk_only", [True, False])

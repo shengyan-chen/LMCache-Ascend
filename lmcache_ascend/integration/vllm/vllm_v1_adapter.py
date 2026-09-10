@@ -633,6 +633,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
 
+        # With MTP, the runner defers connector finalization until draft forward
+        # has populated its Attention KV. Do not move hybrid stores to the end
+        # of target forward; candidate acceptance still belongs to the runner.
         # vLLM invokes this method from a generator finally, even if forward fails.
         forward_failed = sys.exc_info()[0] is not None
         connector_metadata = self._parent._get_connector_metadata()

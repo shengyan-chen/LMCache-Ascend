@@ -142,8 +142,29 @@ def select_state_primary(kv_cache_config: Any) -> int | None:
 
 def validate_state_config(config: Any, vllm_config: Any) -> None:
     """The first hybrid path uses synchronous all-rank text/TP CPU/disk caching."""
-    if vllm_config.speculative_config is not None:
-        raise ValueError("GDN checkpoints do not support MTP/speculative decoding")
+    speculative = vllm_config.speculative_config
+    if speculative is not None:
+        # vLLM normalizes the CLI's qwen3_5_mtp method to "mtp". Restrict
+        # both model identities, rather than admitting every MTP/Eagle model.
+        if getattr(speculative, "method", None) != "mtp":
+            raise ValueError("GDN speculative decoding supports only Qwen3.5 MTP")
+        target = vllm_config.model_config
+        draft = speculative.draft_model_config
+        if (
+            target.hf_text_config.model_type not in ("qwen3_5_text", "qwen3_5_moe_text")
+            or draft.hf_config.model_type != "qwen3_5_mtp"
+        ):
+            raise ValueError("GDN MTP requires Qwen3.5 target and draft models")
+        if config.save_decode_cache:
+            raise ValueError("GDN MTP prefill reuse requires save_decode_cache=false")
+        if vllm_config.scheduler_config.async_scheduling:
+            raise ValueError("GDN MTP requires synchronous scheduling")
+        if (
+            not target.enforce_eager
+            or not draft.enforce_eager
+            or speculative.enforce_eager is False
+        ):
+            raise ValueError("GDN MTP requires eager target and draft execution")
     if vllm_config.parallel_config.pipeline_parallel_size != 1:
         raise ValueError("GDN checkpoints do not support pipeline parallelism")
     # Qwen3.5 may expose a multimodal model config; request payloads are checked
