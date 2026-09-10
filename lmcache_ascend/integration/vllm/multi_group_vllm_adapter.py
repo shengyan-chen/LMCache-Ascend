@@ -326,6 +326,8 @@ class AscendConnectorMetadata(LMCacheConnectorMetadata):
 class RequestTracker(UpstreamRequestTracker):
     # Block ids grouped by KV cache group (multi-group path).
     allocated_block_ids_by_group: "tuple[list[int], ...]" = field(default_factory=tuple)
+    # Per-step hybrid policy, separate from the persistent request skip flag.
+    save_in_current_step: bool = True
 
     @property
     def num_kv_groups(self) -> int:
@@ -498,6 +500,8 @@ class ReqMeta(UpstreamReqMeta):
         )
 
         saved_allocated_block_ids = tracker.allocated_block_ids
+        saved_skip_save = tracker.skip_save
+        tracker.skip_save = saved_skip_save or not tracker.save_in_current_step
         tracker.allocated_block_ids = list(
             tracker.allocated_block_ids_by_group[primary_kv_group_idx]
         )
@@ -512,6 +516,7 @@ class ReqMeta(UpstreamReqMeta):
             )
         finally:
             tracker.allocated_block_ids = saved_allocated_block_ids
+            tracker.skip_save = saved_skip_save
 
         if base is None:
             return None
@@ -566,6 +571,7 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
     # Annotated here for mypy: assigned in upstream __init__/_init_connector_state
     # and temporarily overridden in record_failed_blocks (per-group block_size).
     _block_size: int
+    _state_mtp: bool = False
 
     def __init__(
         self,
@@ -601,6 +607,9 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
         super()._init_connector_state(role, vllm_config, config)
         self._allocated_blocks: dict[str, tuple[list[int], ...]] = {}
         self._state_primary_kv_group_idx: int | None = primary
+        self._state_mtp = (
+            primary is not None and vllm_config.speculative_config is not None
+        )
         if self._kv_cache_config is not None and getattr(
             self._kv_cache_config, "kv_cache_groups", None
         ):
@@ -736,6 +745,23 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
             tracker.allocated_block_ids_by_group = blocks
             tracker._sync_primary_allocated_block_ids()
 
+    def _prepare_state_request(
+        self, tracker: RequestTracker, start: int, output: SchedulerOutput
+    ) -> None:
+        """Set hybrid store policy before ReqMeta advances the saved prefix."""
+        if self._state_primary_kv_group_idx is None:
+            return
+        drafts = output.scheduled_spec_decode_tokens.get(tracker.req_id)
+        if tracker.mm_hashes or (drafts and not self._state_mtp):
+            raise ValueError("State execution requires supported text requests")
+        tracker.is_decode_phase = start >= tracker.prompt_len
+        end = start + output.num_scheduled_tokens[tracker.req_id]
+        # Scheduled draft tokens are not accepted state. A draft forward after
+        # prefill, on the other hand, does not make that prefill step a decode.
+        tracker.save_in_current_step = not self._state_mtp or (
+            not tracker.is_decode_phase and not drafts and end <= tracker.prompt_len
+        )
+
     def _attach_state_executions(
         self, meta: AscendConnectorMetadata, output: SchedulerOutput
     ) -> AscendConnectorMetadata:
@@ -771,12 +797,10 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
         for req_id, (start, can_load) in intervals.items():
             tracker = self._request_trackers[req_id]
             end = start + output.num_scheduled_tokens[req_id]
-            # Speculative tokens and multimodal identity are outside PR3's
-            # initial contract; do not expose a misleading state candidate.
-            if output.scheduled_spec_decode_tokens.get(req_id) or tracker.mm_hashes:
-                raise ValueError(
-                    "State execution requires non-speculative text requests"
-                )
+            if tracker.mm_hashes or (
+                output.scheduled_spec_decode_tokens.get(req_id) and not self._state_mtp
+            ):
+                raise ValueError("State execution requires supported text requests")
             tables = [list(ids) for ids in tracker.allocated_block_ids_by_group]
             for group, size in state_sizes:
                 # Running SchedulerOutput carries append-only allocation deltas.
@@ -802,7 +826,8 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
                     request_configs=deepcopy(tracker.request_configs),
                     can_load=can_load,
                     can_save=(
-                        not tracker.skip_save
+                        tracker.save_in_current_step
+                        and not tracker.skip_save
                         and not (tracker.request_configs or {}).get(
                             "lmcache.skip_save", False
                         )
@@ -904,6 +929,9 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
             self._request_trackers[request.req_id] = request_tracker
 
             self._apply_allocated_blocks(request_tracker)
+            self._prepare_state_request(
+                request_tracker, request.num_computed_tokens, scheduler_output
+            )
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_sizes_by_group,
@@ -954,6 +982,9 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
                 )
 
                 self._apply_allocated_blocks(request_tracker)
+                self._prepare_state_request(
+                    request_tracker, req.num_computed_tokens, scheduler_output
+                )
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_sizes_by_group,
@@ -1068,6 +1099,9 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
             )
 
             self._apply_allocated_blocks(request_tracker)
+            self._prepare_state_request(
+                request_tracker, cached_reqs.num_computed_tokens[i], scheduler_output
+            )
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_sizes_by_group,

@@ -707,6 +707,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
             try:
                 save_spec = request.save_spec
                 token_ids = request.token_ids
+                # MTP decode must not publish even on a producer or via the
+                # local-persistence fallback below. Keep load metadata intact.
+                if self._state_mtp and (save_spec is None or not save_spec.can_save):
+                    continue
 
                 # lmcache-ascend start: local-vs-remote hit distinction ------
                 # ``save_spec.skip_leading_tokens`` is seeded from the *total*
@@ -933,6 +937,8 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
         if not layouts:
             return
         for execution in getattr(metadata, "state_executions", ()):
+            if not execution.can_save:
+                continue
             if execution.req_id in getattr(self, "_failed_state_loads", set()):
                 continue
             try:
@@ -956,7 +962,9 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
         save_spec = request.save_spec
         if save_spec is None:
             return False
-        if not save_spec.can_save and self.kv_role != "kv_producer":
+        if not save_spec.can_save and (
+            self._state_mtp or self.kv_role != "kv_producer"
+        ):
             return False
         return save_spec.skip_leading_tokens != len(request.token_ids)
 

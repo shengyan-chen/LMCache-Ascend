@@ -735,6 +735,89 @@ def test_raw_execution_survives_attention_clipping_and_no_attention_work(
     assert execution.block_ids_by_group[1][0] == 0
 
 
+@pytest.mark.parametrize(
+    "start,end,prompt,drafts,can_save",
+    [
+        (0, 1024, 2048, [], True),
+        (1023, 1024, 1024, [], True),
+        (1024, 2048, 2048, [], True),
+        (1024, 2048, 1024, [], False),
+        (1024, 2048, 1024, [42], False),
+        (1023, 1025, 1024, [42], False),
+    ],
+)
+@pytest.mark.parametrize("kind", ["new", "cached", "resumed"])
+def test_mtp_phase_controls_attention_and_state_before_metadata(
+    start, end, prompt, drafts, can_save, kind
+):
+    # Third Party
+    from lmcache.integration.vllm.vllm_v1_adapter import LoadSpec
+
+    tracker = RequestTracker(
+        req_id="r",
+        prompt_len=prompt,
+        token_ids=list(range(end)),
+        allocated_block_ids=[1, 2, 3, 4],
+        allocated_block_ids_by_group=([1, 2, 3, 4], [71, 72, 73, 74]),
+    )
+    tracker.is_decode_phase = True  # The upstream one-token heuristic is sticky.
+    connector = _connector(tracker)
+    connector._state_mtp = True
+    output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="r", num_computed_tokens=start)]
+        if kind == "new"
+        else [],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[] if kind == "new" else ["r"],
+            num_computed_tokens=[start],
+            resumed_req_ids={"r"} if kind == "resumed" else set(),
+        ),
+        num_scheduled_tokens={"r": end - start},
+        scheduled_spec_decode_tokens={"r": drafts},
+    )
+    connector._prepare_state_request(tracker, start, output)
+    load = LoadSpec(vllm_cached_tokens=0, lmcache_cached_tokens=1024, can_load=True)
+    request = ReqMeta.from_request_tracker(
+        tracker,
+        (512, 512),
+        1024,
+        load_spec=load,
+        primary_kv_group_idx=0,
+    )
+    assert request is not None and request.load_spec is load
+    assert request.save_spec.can_save is can_save
+    assert tracker.num_saved_tokens == (end // 1024 * 1024 if can_save else 0)
+    assert not tracker.skip_save
+    assert tracker.is_decode_phase is (start >= prompt)
+    metadata = connector._attach_state_executions(AscendConnectorMetadata(), output)
+    assert metadata.state_executions[0].can_save is can_save
+    assert metadata.state_executions[0].can_load is (kind != "cached")
+
+
+def test_non_mtp_decode_save_configuration_is_preserved():
+    tracker = RequestTracker(
+        req_id="r",
+        prompt_len=1024,
+        token_ids=list(range(2048)),
+        allocated_block_ids=[1, 2, 3, 4],
+        allocated_block_ids_by_group=([1, 2, 3, 4], [71, 72, 73, 74]),
+    )
+    connector = _connector(tracker)
+    output = SimpleNamespace(
+        num_scheduled_tokens={"r": 1024}, scheduled_spec_decode_tokens={}
+    )
+    connector._prepare_state_request(tracker, 1024, output)
+    meta = ReqMeta.from_request_tracker(
+        tracker,
+        (512, 512),
+        1024,
+        save_decode_cache=True,
+        primary_kv_group_idx=0,
+    )
+    assert meta.save_spec.can_save
+    assert tracker.num_saved_tokens == 2048
+
+
 def test_complete_allocation_replaces_old_attempt_and_is_snapshotted():
     tracker = RequestTracker(
         req_id="r",
@@ -864,6 +947,42 @@ def test_state_save_runs_without_attention_requests(
     worker.lmcache_engine.store_state.assert_called_once_with(
         execution, worker.state_layouts, worker.state_kv_caches, event
     )
+
+
+@pytest.mark.parametrize("role", ["kv_both", "kv_producer"])
+def test_mtp_decode_cannot_publish_even_on_producer(monkeypatch, role):
+    worker = LMCacheAscendConnectorV1Impl.__new__(LMCacheAscendConnectorV1Impl)
+    execution = StateExecution(
+        "r", tuple(range(32)), 16, 32, 32, ((), (1, 2)), ((1, 16),), False, False
+    )
+    request = SimpleNamespace(
+        req_id="r",
+        token_ids=list(range(32)),
+        save_spec=SimpleNamespace(can_save=False, skip_leading_tokens=0),
+    )
+    meta = AscendConnectorMetadata(requests=[request], state_executions=[execution])
+    worker._parent = SimpleNamespace(_get_connector_metadata=lambda: meta)
+    worker._state_mtp = True
+    worker.kv_role = role
+    worker.use_layerwise = False
+    worker.kv_caches = {"attention": object()}
+    worker.state_layouts = (object(),)
+    worker.state_kv_caches = {}
+    engine = SimpleNamespace(
+        _is_passive=lambda: False,
+        lookup_unpin=Mock(),
+        store=Mock(),
+        store_state=Mock(),
+    )
+    worker._manager = SimpleNamespace(lmcache_engine=engine)
+    worker._replay_finished_stores_after_save = Mock()
+    # A persistence fallback must not override MTP's per-step save policy.
+    worker._local_persist_skip = Mock(return_value=0)
+    monkeypatch.setattr(torch.npu, "Event", Mock())
+    worker.wait_for_save()
+    engine.store.assert_not_called()
+    engine.store_state.assert_not_called()
+    assert not worker._may_register_store_after_wait_for_save(request)
 
 
 def test_generator_finally_forward_failure_skips_hybrid_publication():
