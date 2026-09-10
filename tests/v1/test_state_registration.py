@@ -177,6 +177,31 @@ def test_registration_split_blocks_preserve_token_slot_addresses(monkeypatch, me
     assert connector._block_sizes_by_group == (16, 16, 16)
 
 
+@pytest.mark.parametrize("state_first", [True, False])
+@pytest.mark.parametrize("merged", [True, False])
+def test_mtp_attention_in_primary_keeps_its_own_tensors(
+    monkeypatch, state_first, merged
+):
+    connector, tensors = _registration(monkeypatch, state_first, merged)
+    primary = select_state_primary(connector._kv_cache_config)
+    group = connector._kv_cache_config.kv_cache_groups[primary]
+    group.layer_names.append("mtp.attn")
+    tensors["mtp.attn"] = (
+        torch.zeros_like(tensors["attn.0"])
+        if merged
+        else tuple(torch.zeros_like(t) for t in tensors["attn.0"])
+    )
+    connector.register_kv_caches(tensors)
+    assert connector.kv_caches["mtp.attn"] is tensors["mtp.attn"]
+    hints = connector.lmcache_engine.gpu_connector.layout_hints
+    assert hints["scheduler_group_by_flat_layer"] == (primary,) * 3
+    assert set(hints["model_kv_caches"]) == {"attn.0", "attn.1", "mtp.attn"}
+    (payload_group,) = (
+        connector.lmcache_engine.metadata.kv_layer_groups_manager.kv_layer_groups
+    )
+    assert payload_group.shape_desc.nl == connector.num_layers == 3
+
+
 @pytest.mark.parametrize(
     "failure", ["block_size", "partial_page", "heads", "dtype", "stride"]
 )

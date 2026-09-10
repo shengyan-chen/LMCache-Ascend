@@ -96,8 +96,9 @@ def assert_payload_matches(buffer, entries, block):
         (torch.float32, torch.bfloat16),
     ],
 )
-def test_kernel_round_trip(pool, dtypes):
-    source = runtime_tensors(dtypes=dtypes)
+@pytest.mark.parametrize("conv_length", [3, 4, 6])
+def test_kernel_round_trip(pool, dtypes, conv_length):
+    source = runtime_tensors(shapes=((conv_length, 128), (2, 128, 128)), dtypes=dtypes)
     target = tuple(tuple(torch.full_like(t, -1) for t in entry) for entry in source)
     layout = group_layout(source)
     with allocate_state_checkpoint(layout, pool) as buffer:

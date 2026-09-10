@@ -30,13 +30,11 @@ def layer_spec(group: Any, layer_name: str) -> Any:
 
 
 def validate_gdn_spec(spec: MambaSpec) -> None:
-    """Reject state kinds/modes outside the non-speculative GDN contract."""
+    """Validate GDN planes; speculative policy belongs to validate_state_config."""
     if spec.mamba_type != MambaAttentionBackendEnum.GDN_ATTN:
         raise ValueError(f"Unsupported state backend: {spec.mamba_type}")
-    if spec.mamba_cache_mode != "align" or spec.num_speculative_blocks != 0:
-        raise ValueError(
-            "GDN checkpoints require align mode without speculative blocks"
-        )
+    if spec.mamba_cache_mode != "align":
+        raise ValueError("GDN checkpoints require align mode")
     if len(spec.shapes) != 2 or len(spec.dtypes) != 2:
         raise ValueError("GDN checkpoints require conv and SSM planes")
 

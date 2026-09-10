@@ -120,7 +120,7 @@ def test_missing_full_attention_primary_is_rejected():
 
 
 @pytest.mark.parametrize(
-    "override", [{"mamba_cache_mode": "all"}, {"num_speculative_blocks": 1}]
+    "override", [{"mamba_cache_mode": "all"}, {"mamba_cache_mode": "none"}]
 )
 def test_unsupported_state_mode_is_rejected(override):
     tensors = [torch.empty(5, 3, 4, dtype=torch.bfloat16), torch.empty(5, 2, 3, 4)]
@@ -128,6 +128,32 @@ def test_unsupported_state_mode_is_rejected(override):
         ordered_scheduler_groups_for_layer(
             "gdn.0", tensors, config_for(spec=gdn_spec(**override))
         )
+
+
+@pytest.mark.parametrize("num_spec", [1, 3])
+@pytest.mark.parametrize("state_first", [True, False])
+def test_mtp_state_uses_full_conv_shape_and_one_ssm(num_spec, state_first):
+    # First Party
+    from lmcache_ascend.integration.vllm.state_groups import build_state_layouts
+
+    spec = gdn_spec(
+        num_speculative_blocks=num_spec,
+        shapes=((3 + num_spec, 4), (2, 3, 4)),
+    )
+    config = config_for(state_first, spec)
+    entries = {
+        name: tuple(
+            torch.empty(5, *shape, dtype=dtype)
+            for shape, dtype in zip(spec.shapes, spec.dtypes, strict=True)
+        )
+        for name in ("gdn.0", "gdn.1")
+    }
+    (layout,) = build_state_layouts(config, entries)
+    assert layout.group_index == (0 if state_first else 1)
+    assert layout.nbytes == 2 * (3 + num_spec) * 4 * 2 + 2 * 2 * 3 * 4 * 4
+    entries["gdn.0"] = (torch.empty(5, 3, 4, dtype=torch.bfloat16), entries["gdn.0"][1])
+    with pytest.raises(ValueError, match="spec mismatch"):
+        build_state_layouts(config, entries)
 
 
 def test_explicit_primary_ignores_current_block_counts():
