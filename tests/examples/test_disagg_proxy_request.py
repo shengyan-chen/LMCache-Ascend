@@ -1,20 +1,54 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 import sys
 
+# Third Party
 import pytest
-
 
 EXAMPLE_DIR = Path(__file__).parents[2] / "examples" / "disagg_prefill"
 sys.path.insert(0, str(EXAMPLE_DIR))
 
+# Third Party
 import disagg_proxy_request as request_helpers  # noqa: E402
 
-
 build_phase_requests = request_helpers.build_phase_requests
+
+
+@pytest.mark.parametrize("prompt", ["hello", "", [0, 2047, 374, 3899]])
+def test_validate_completion_prompt_preserves_input(prompt):
+    request_data = {"prompt": prompt}
+    original = deepcopy(request_data)
+    result = request_helpers.validate_completion_prompt(request_data)
+    assert result == prompt
+    assert request_data == original
+    if isinstance(prompt, list):
+        assert result is not prompt
+
+
+@pytest.mark.parametrize(
+    "request_data",
+    [
+        None,
+        [],
+        {},
+        {"prompt": None},
+        {"prompt": 1},
+        {"prompt": []},
+        {"prompt": [True]},
+        {"prompt": [-1]},
+        {"prompt": [1.0]},
+        {"prompt": [1, "x"]},
+        {"prompt": ["a", "b"]},
+        {"prompt": [[1, 2]]},
+    ],
+)
+def test_validate_completion_prompt_rejects_invalid_and_batch_inputs(request_data):
+    with pytest.raises(ValueError):
+        request_helpers.validate_completion_prompt(request_data)
 
 
 @pytest.mark.parametrize(

@@ -14,21 +14,6 @@ import time
 import uuid
 
 # Third Party
-from fastapi import FastAPI, Request
-from fastapi.responses import Response, StreamingResponse
-import httpx
-import msgspec
-import numpy as np
-import zmq
-import zmq.asyncio
-
-# First Party
-from lmcache.logging import init_logger
-from lmcache.v1.storage_backend.pd_backend import (
-    PDMsg,
-    ProxyNotif,
-)
-
 from disagg_proxy_request import (
     UpstreamServiceError,
     build_chat_phase_requests,
@@ -36,7 +21,20 @@ from disagg_proxy_request import (
     normalize_chat_request,
     parse_chat_render_output,
     upstream_service_error_from_response,
+    validate_completion_prompt,
 )
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from lmcache.logging import init_logger
+from lmcache.v1.storage_backend.pd_backend import (
+    PDMsg,
+    ProxyNotif,
+)
+import httpx
+import msgspec
+import numpy as np
+import zmq
+import zmq.asyncio
 
 logger = init_logger(__name__)
 
@@ -645,9 +643,7 @@ async def stream_service_response(
 
 
 def encode_sse_data(data: dict) -> bytes:
-    return (
-        "data: " + json.dumps(data, separators=(",", ":")) + "\n\n"
-    ).encode()
+    return ("data: " + json.dumps(data, separators=(",", ":")) + "\n\n").encode()
 
 
 async def stream_prefill_only_completion_response(
@@ -766,9 +762,7 @@ async def select_decoder(
             "decoder_policy": "min_active_decode_tokens",
             "decode_score": prompt_token_count,
             "pd_transfer_mode": selected.pd_transfer_mode,
-            "pd_buffer_admission_enabled": (
-                selected.pd_buffer_semaphore is not None
-            ),
+            "pd_buffer_admission_enabled": (selected.pd_buffer_semaphore is not None),
             "selected_decoder": selected.name,
             "selected_decoder_load_before": selected_load_before,
             "selected_decoder_state_after": selected.snapshot(),
@@ -783,9 +777,7 @@ async def select_prefiller(
         raise ValueError("No prefiller clients configured")
 
     async with app.state.prefiller_lock:
-        candidate_loads = [
-            state.snapshot() for state in app.state.prefiller_states
-        ]
+        candidate_loads = [state.snapshot() for state in app.state.prefiller_states]
         selected = min(
             app.state.prefiller_states,
             key=lambda state: (
@@ -911,9 +903,11 @@ def _format_prefiller_candidate(state: dict) -> str:
 def _format_candidate_prefillers(candidate_loads: list[dict]) -> str:
     if not candidate_loads:
         return "[]"
-    return "[" + "; ".join(
-        _format_prefiller_candidate(state) for state in candidate_loads
-    ) + "]"
+    return (
+        "["
+        + "; ".join(_format_prefiller_candidate(state) for state in candidate_loads)
+        + "]"
+    )
 
 
 def _format_decoder_active(state: dict) -> str:
@@ -931,8 +925,7 @@ def _format_pd_slots(state: dict) -> str:
     if not state.get("pd_buffer_admission_enabled", False):
         return "disabled"
     return (
-        f"{state.get('pd_slots_available', '-')}/"
-        f"{state.get('pd_slots_capacity', '-')}"
+        f"{state.get('pd_slots_available', '-')}/{state.get('pd_slots_capacity', '-')}"
     )
 
 
@@ -962,9 +955,11 @@ def _format_decoder_candidate(state: dict) -> str:
 def _format_candidate_decoders(candidate_loads: list[dict]) -> str:
     if not candidate_loads:
         return "[]"
-    return "[" + "; ".join(
-        _format_decoder_candidate(state) for state in candidate_loads
-    ) + "]"
+    return (
+        "["
+        + "; ".join(_format_decoder_candidate(state) for state in candidate_loads)
+        + "]"
+    )
 
 
 def _format_route_summary(event: str, payload: dict) -> str:
@@ -995,8 +990,7 @@ def _format_route_summary(event: str, payload: dict) -> str:
         f"{prefiller_selected_state.get('load_score', '-')}",
         " - prefiller_load_after_release: "
         f"{prefiller_released_state.get('load_score', '-')}",
-        " - decoder_load_before: "
-        f"{payload.get('selected_decoder_load_before', '-')}",
+        f" - decoder_load_before: {payload.get('selected_decoder_load_before', '-')}",
         " - decoder_load_after_select: "
         f"{decoder_selected_state.get('load_score', '-')}",
         " - decoder_load_after_release: "
@@ -1014,8 +1008,7 @@ def _format_route_summary(event: str, payload: dict) -> str:
         lines.append(f" - response_mode: {payload['response_mode']}")
     if "prefill_first_token_exposed" in payload:
         lines.append(
-            " - prefill_first_token_exposed: "
-            f"{payload['prefill_first_token_exposed']}"
+            f" - prefill_first_token_exposed: {payload['prefill_first_token_exposed']}"
         )
     if payload.get("kv_ready_wait_ms") is not None:
         lines.append(
@@ -1103,23 +1096,40 @@ async def handle_completions(request: Request):
     try:
         req_data = await request.json()
 
-        tokenization_client = pick_up_tokenization_client(request)
+        try:
+            prompt = validate_completion_prompt(req_data)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": str(exc),
+                        "type": "invalid_request_error",
+                        "param": "prompt",
+                        "code": None,
+                    }
+                },
+            )
 
-        tokenize_output = await send_request_to_service(
-            tokenization_client.client, "/tokenize", {"prompt": req_data["prompt"]}
-        )
-        tokenize_output = tokenize_output.json()
-        prompt_token_count = len(tokenize_output["tokens"])
+        tokenization_client_name = None
+        if isinstance(prompt, str):
+            tokenization_client = pick_up_tokenization_client(request)
+            tokenization_client_name = tokenization_client.name
+            tokenize_output = await send_request_to_service(
+                tokenization_client.client, "/tokenize", {"prompt": prompt}
+            )
+            prompt_token_ids = tokenize_output.json()["tokens"]
+        else:
+            prompt_token_ids = prompt
+        prompt_token_count = len(prompt_token_ids)
         prefill_req_data, decode_req_data = build_phase_requests(
             req_data,
-            tokenize_output["tokens"],
+            prompt_token_ids,
             is_chat=False,
         )
 
         if decode_req_data["max_tokens"] == 0:
-            prefiller_state, prefiller_info = await select_prefiller(
-                prompt_token_count
-            )
+            prefiller_state, prefiller_info = await select_prefiller(prompt_token_count)
             prefill_client = prefiller_state.client_info
             route_info = dict(prefiller_info)
             route_info.update(
@@ -1129,7 +1139,7 @@ async def handle_completions(request: Request):
                     "prompt_token_count": prompt_token_count,
                     "chosen_prefiller": prefiller_state.name,
                     "chosen_decoder": "prefill-only",
-                    "tokenization_client": tokenization_client.name,
+                    "tokenization_client": tokenization_client_name,
                     "pd_transfer_mode": "prefill-only",
                     "pd_buffer_admission_enabled": False,
                 }
@@ -1171,9 +1181,7 @@ async def handle_completions(request: Request):
                 (req_data.get("stream_options") or {}).get("include_usage")
             )
             return StreamingResponse(
-                stream_prefill_only_completion_response(
-                    prefill_output, include_usage
-                ),
+                stream_prefill_only_completion_response(prefill_output, include_usage),
                 media_type="application/json",
             )
 
@@ -1185,7 +1193,7 @@ async def handle_completions(request: Request):
                 "endpoint": "/v1/completions",
                 "prompt_token_count": prompt_token_count,
                 "chosen_decoder": decoder_state.name,
-                "tokenization_client": tokenization_client.name,
+                "tokenization_client": tokenization_client_name,
             }
         )
         decode_client = decoder_state.client_info
@@ -1280,9 +1288,7 @@ async def handle_completions(request: Request):
                     "usage": None,
                 }
                 yield (
-                    "data: "
-                    + json.dumps(head_chunk, separators=(",", ":"))
-                    + "\n\n"
+                    "data: " + json.dumps(head_chunk, separators=(",", ":")) + "\n\n"
                 ).encode()
 
                 kv_ready_wait_start = time.time()
@@ -1509,6 +1515,7 @@ async def handle_chat_completions(request: Request):
         log_route_event("proxy_route_prefill_done", route_log_base)
 
         if decode_req_data.get("stream", False):
+
             async def generate_stream():
                 nonlocal decoder_released, pd_slots_released
                 kv_ready_wait_ms = None
@@ -1559,9 +1566,7 @@ async def handle_chat_completions(request: Request):
                     )
                     log_route_event("proxy_route_complete", complete_payload)
 
-            return StreamingResponse(
-                generate_stream(), media_type="text/event-stream"
-            )
+            return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
         kv_ready_wait_start = time.time()
         await wait_decode_kv_ready(req_id, num_tp_rank)
