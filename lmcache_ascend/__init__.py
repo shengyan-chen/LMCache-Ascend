@@ -158,6 +158,17 @@ def _patch_lazy_memory_allocator():
         # ascend extension directly here, at construction time.
         # First Party
         import lmcache_ascend.c_ops as ascend_c_ops
+        from lmcache_ascend.v1.distributed.mooncake_te_registration import (
+            POOLS,
+            is_active,
+            is_enabled,
+        )
+
+        if is_enabled() and not is_active():
+            raise RuntimeError(
+                "MP Host handoff requires the "
+                "lmcache_ascend.v1.distributed.mooncake_cs_server launcher"
+            )
 
         self._use_numa = False
         self._curr_size = align_to(init_size, self.PIN_CHUNK_SIZE)
@@ -183,6 +194,8 @@ def _patch_lazy_memory_allocator():
         # Whole pool from aclrtMallocHost: pinned + registered at allocation time,
         # so no per-chunk aclrtHostRegister is needed (or reliable).
         ptr = ascend_c_ops.alloc_pinned_ptr(self._final_size, 0)
+        if is_active():
+            POOLS.track(ptr, self._final_size, torch.npu.current_device())
         arr_type = ctypes.c_uint8 * self._final_size
         self._buffer = torch.frombuffer(arr_type.from_address(ptr), dtype=torch.uint8)
         self._ascend_pool_ptr: int = ptr
@@ -206,11 +219,14 @@ def _patch_lazy_memory_allocator():
         """Stop the expand thread and release the aclrtMallocHost allocation."""
         # First Party
         import lmcache_ascend.c_ops as ascend_c_ops
+        from lmcache_ascend.v1.distributed.mooncake_te_registration import POOLS
 
         self._stop_expand.set()
         self._expand_thread.join()
+        POOLS.check_free(self._ascend_pool_ptr)
         # Releases the internal register_ptr + the aclrtMallocHost allocation.
         ascend_c_ops.free_pinned_ptr(self._ascend_pool_ptr)
+        POOLS.forget(self._ascend_pool_ptr)
 
     LazyMemoryAllocator.__init__ = _ascend_init  # type: ignore[assignment]
     LazyMemoryAllocator._pin_memory_chunk = _ascend_pin_memory_chunk  # type: ignore[assignment]
