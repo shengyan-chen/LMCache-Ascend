@@ -16,8 +16,8 @@ from lmcache_ascend import _build_info
 # is also used by the test infrastructure.
 LMCACHE_UPSTREAM_TAG = "v0.4.4"
 LMCACHE_ASCEND_PATCHED = False
-# Set once _patch_lazy_memory_allocator successfully swaps the pool to
-# alloc_pinned_ptr; the patch is exception-safe and retried after _patch_ops.
+# Set once the selectable MP host allocator patch is installed;
+# activation is retried after _patch_ops when imports are initially circular.
 _lazy_alloc_patched = False
 
 
@@ -96,7 +96,7 @@ def _seed_partial_lmcache_device_ops() -> None:
 
 
 def _patch_lazy_memory_allocator():
-    """Back the LazyMemoryAllocator pool with aclrtMallocHost-pinned memory.
+    """Select ACL or ordinary Host storage for the MP LazyMemoryAllocator.
 
     Upstream allocates the cache-server pool with ``torch.empty`` and pins each
     chunk post-hoc via ``torch_dev.ext.pin_memory`` (``aclrtHostRegister``).
@@ -107,11 +107,11 @@ def _patch_lazy_memory_allocator():
     memory that is pinned and registered at allocation time (async D2H works with
     no post-hoc register).
 
-    This replaces ``__init__`` to source the whole pool from ``alloc_pinned_ptr``
-    (NUMA binding is intentionally not applied -- the server runs without a NUMA
-    mapping), makes ``_pin_memory_chunk`` a no-op (the pool is already pinned), and
-    frees via ``free_pinned_ptr`` at close. No-op when ``alloc_pinned_ptr`` is
-    absent (non-ascend build).
+    ``LMCACHE_ASCEND_MP_HOST_ALLOCATOR=ordinary`` instead uses aligned CPU tensor
+    storage without NPU host registration, for ordinary RDMA devices that cannot
+    register ACL Host allocations. This opt-in mode targets ``lmcache_driven``
+    staging copies, not kernels that directly dereference mapped Host memory.
+    ACL remains the default. NUMA binding is not applied in either mode.
     """
     # Applied once; idempotent and exception-safe so it can be retried after
     # ``_patch_ops`` sets ``lmcache.c_ops`` (the early call during ``import
@@ -122,6 +122,7 @@ def _patch_lazy_memory_allocator():
 
     # Standard
     import ctypes
+    import os
     import threading
 
     # Third Party
@@ -145,6 +146,8 @@ def _patch_lazy_memory_allocator():
         )
         return
 
+    original_log_expansion = LazyMemoryAllocator._log_expansion_progress
+
     def _ascend_init(
         self: LazyMemoryAllocator,
         init_size: int,
@@ -152,40 +155,55 @@ def _patch_lazy_memory_allocator():
         align_bytes: int = AddressManager.ALIGN_BYTES,
         numa_mapping: Any = None,
     ) -> None:
-        """Mirror upstream ``__init__`` but back the buffer with aclrtMallocHost."""
-        # Lazy import: at plugin-activation time ``lmcache.c_ops`` has not yet been
-        # swapped to the ascend backend (``_patch_ops`` runs later), so resolve the
-        # ascend extension directly here, at construction time.
-        # First Party
-        import lmcache_ascend.c_ops as ascend_c_ops
-
+        """Allocate a fixed Host arena and retain its allocation mode for close."""
+        mode_key = "LMCACHE_ASCEND_MP_HOST_ALLOCATOR"
+        self._host_allocator_mode = os.environ.get(mode_key, "acl")
+        if self._host_allocator_mode not in ("acl", "ordinary"):
+            raise ValueError(f"{mode_key} must be 'acl' or 'ordinary'")
+        if align_bytes <= 0 or align_bytes & (align_bytes - 1):
+            raise ValueError("align_bytes must be a positive power of two")
+        if init_size < 0 or final_size <= 0 or init_size > final_size:
+            raise ValueError("sizes must satisfy 0 <= init_size <= final_size > 0")
         self._use_numa = False
+        self._host_pool_closed = False
         self._curr_size = align_to(init_size, self.PIN_CHUNK_SIZE)
         self._final_size = align_to(final_size, self.PIN_CHUNK_SIZE)
-        try:
-            # Third Party
-            from lmcache.v1.platform import current_device_spec
-
-            pin_supported = current_device_spec.is_pin_supported
-        except ImportError:  # upstream <= #4001 exposed torch_dev.ext
-            pin_supported = torch_dev.ext.is_pin_supported
-        if not pin_supported:
-            raise RuntimeError(
-                "Backend does not support memory pinning. "
-                "LazyMemoryAllocator requires pinned memory."
-            )
         self._pin_record: list[tuple[int, int]] = []
-        # Ensure an ACL context on this thread: aclrtMallocHost (inside
-        # alloc_pinned_ptr) fails with 107002 if no device op has run yet, e.g.
-        # on the cache-server thread. Idempotent on workers that already have one.
-        if torch.npu.is_available():
-            torch.npu.set_device(torch.npu.current_device())
-        # Whole pool from aclrtMallocHost: pinned + registered at allocation time,
-        # so no per-chunk aclrtHostRegister is needed (or reliable).
-        ptr = ascend_c_ops.alloc_pinned_ptr(self._final_size, 0)
-        arr_type = ctypes.c_uint8 * self._final_size
-        self._buffer = torch.frombuffer(arr_type.from_address(ptr), dtype=torch.uint8)
-        self._ascend_pool_ptr: int = ptr
+        if self._host_allocator_mode == "ordinary":
+            # The slice retains its CPU storage; never free its pointer via ACL.
+            backing = torch.empty(
+                self._final_size + align_bytes - 1,
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=False,
+            )
+            offset = (-backing.data_ptr()) % align_bytes
+            self._buffer = backing[offset : offset + self._final_size]
+        else:
+            # First Party
+            import lmcache_ascend.c_ops as ascend_c_ops
+
+            try:
+                # Third Party
+                from lmcache.v1.platform import current_device_spec
+
+                pin_supported = current_device_spec.is_pin_supported
+            except ImportError:  # upstream <= #4001 exposed torch_dev.ext
+                pin_supported = torch_dev.ext.is_pin_supported
+            if not pin_supported:
+                raise RuntimeError(
+                    "Backend does not support memory pinning. "
+                    "LazyMemoryAllocator requires pinned memory."
+                )
+            # aclrtMallocHost needs an ACL context on the allocating thread.
+            if torch.npu.is_available():
+                torch.npu.set_device(torch.npu.current_device())
+            ptr = ascend_c_ops.alloc_pinned_ptr(self._final_size, 0)
+            arr_type = ctypes.c_uint8 * self._final_size
+            self._buffer = torch.frombuffer(
+                arr_type.from_address(ptr), dtype=torch.uint8
+            )
+            self._ascend_pool_ptr: int = ptr
         self._allocator = TensorMemoryAllocator(
             tensor=self._buffer,
             align_bytes=align_bytes,
@@ -197,28 +215,51 @@ def _patch_lazy_memory_allocator():
             target=self._expand_worker, daemon=True, name="lazy-mem-expand-thread"
         )
         self._expand_thread.start()
+        _logger.info(
+            "MP Host L1 allocated: mode=%s ptr=%#x size=%d align_bytes=%d",
+            self._host_allocator_mode,
+            self._buffer.data_ptr(),
+            self._final_size,
+            align_bytes,
+        )
 
     def _ascend_pin_memory_chunk(self, offset: int, size: int) -> None:
-        """No-op: the pool is already pinned by ``alloc_pinned_ptr``."""
+        """ACL is already pinned; ordinary mode intentionally skips NPU pinning."""
         return
 
     def _ascend_close(self: LazyMemoryAllocator) -> None:
-        """Stop the expand thread and release the aclrtMallocHost allocation."""
-        # First Party
-        import lmcache_ascend.c_ops as ascend_c_ops
-
+        """Close after transfers/MRs are drained, using allocation-time ownership."""
+        if self._host_pool_closed:
+            return
         self._stop_expand.set()
         self._expand_thread.join()
-        # Releases the internal register_ptr + the aclrtMallocHost allocation.
-        ascend_c_ops.free_pinned_ptr(self._ascend_pool_ptr)
+        if self._host_allocator_mode == "acl":
+            # First Party
+            import lmcache_ascend.c_ops as ascend_c_ops
+
+            ascend_c_ops.free_pinned_ptr(self._ascend_pool_ptr)
+        # Ordinary tensor storage is reclaimed when its last owner is released,
+        # including TensorMemoryAllocator and any surviving MemoryObj views.
+        self._host_pool_closed = True
+
+    def _ascend_log_expansion(self, expanded_since_last_log: int) -> None:
+        if self._host_allocator_mode == "acl":
+            original_log_expansion(self, expanded_since_last_log)
+            return
+        _logger.info(
+            "LazyMemoryAllocator: ordinary Host capacity expanded by %d MiB, "
+            "now %d / %d MiB (no NPU host registration)",
+            expanded_since_last_log >> 20,
+            self._curr_size >> 20,
+            self._final_size >> 20,
+        )
 
     LazyMemoryAllocator.__init__ = _ascend_init  # type: ignore[assignment]
     LazyMemoryAllocator._pin_memory_chunk = _ascend_pin_memory_chunk  # type: ignore[assignment]
     LazyMemoryAllocator.close = _ascend_close  # type: ignore[assignment]
+    LazyMemoryAllocator._log_expansion_progress = _ascend_log_expansion
     _lazy_alloc_patched = True
-    _logger.info(
-        "Routed LazyMemoryAllocator pool through alloc_pinned_ptr (aclrtMallocHost)"
-    )
+    _logger.info("Installed MP Host allocator selection (acl default; ordinary opt-in)")
 
 
 def _patch_config():

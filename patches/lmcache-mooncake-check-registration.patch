@@ -1,0 +1,18 @@
+diff --git a/lmcache/v1/distributed/transfer_channel/impl/mooncake_te_impl.py b/lmcache/v1/distributed/transfer_channel/impl/mooncake_te_impl.py
+--- a/lmcache/v1/distributed/transfer_channel/impl/mooncake_te_impl.py
++++ b/lmcache/v1/distributed/transfer_channel/impl/mooncake_te_impl.py
+@@ -340,7 +340,13 @@
+         self._mooncake_te_port = self._mooncake_te_engine.get_rpc_port()
+         # Register the whole L1 buffer once (CPU/DRAM, fixed mooncake_te dev_id=0).
+         ptr, size = l1_memory_desc.ptr, l1_memory_desc.size
+-        self._mooncake_te_engine.register_memory(ptr, size)
++        ret = self._mooncake_te_engine.register_memory(ptr, size)
++        if ret != 0:
++            raise RuntimeError(
++                f"Failed to register L1 memory with mooncake_te: "
++                f"ptr={ptr:#x}, size={size}, protocol={self._protocol}, "
++                f"device={self._device_id}, ret={ret}"
++            )
+
+         # Build + prep a page-granular local xfer dlist over the whole buffer.
+         self.zmq_context = zmq.Context.instance()
