@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Configuration policy for the opt-in MP L1 ACL host-memory path.
+"""Configuration and allocator helpers for the opt-in MP L1 ACL Host path.
 
 This module neither installs patches nor initializes the NPU runtime. Call
 the MP validator before the server's SHM capacity fallback and L1 creation.
@@ -9,8 +9,11 @@ the MP validator before the server's SHM capacity fallback and L1 creation.
 from __future__ import annotations
 
 # Standard
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
+import logging
 import os
+import threading
 
 if TYPE_CHECKING:
     # Third Party
@@ -18,9 +21,11 @@ if TYPE_CHECKING:
         L1MemoryManagerConfig,
         StorageManagerConfig,
     )
+    from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
     from lmcache.v1.multiprocess.config import MPServerConfig
 
 _ALLOCATOR_ENV = "LMCACHE_ASCEND_MP_HOST_MEMORY_ALLOCATOR"
+logger = logging.getLogger(__name__)
 
 
 def get_mp_host_memory_allocator() -> Literal["default", "aclrt_malloc_host"]:
@@ -104,3 +109,80 @@ def validate_mp_host_memory_config(
             device_type,
             shm_name=mp_config.shm_name if override_shm else None,
         )
+
+
+def create_acl_mixed_allocator(
+    config: L1MemoryManagerConfig, device_type: str
+) -> MixedMemoryAllocator:
+    """Build an MP L1 Mixed instance over pure ACL Host memory.
+
+    The caller must prepare the runtime and install the Mixed close adapter
+    before using this helper. No patches or runtime initialization happen here.
+    Initialization mirrors the non-paging Mixed path in LMCache v0.5.7; keep
+    these fields in step with that constructor when upgrading the baseline.
+    """
+    validate_acl_l1_config(config, device_type)
+    align_bytes = config.align_bytes
+    if align_bytes <= 0 or align_bytes & (align_bytes - 1) != 0:
+        raise ValueError("align_bytes must be a positive power of two")
+
+    # Third Party
+    from lmcache.v1.memory_allocators import mixed_memory_allocator as mixed
+
+    # First Party
+    from lmcache_ascend.v1.host_memory import allocate_host_memory
+
+    allocator = object.__new__(mixed.MixedMemoryAllocator)
+    allocation = allocate_host_memory(config.size_in_bytes)
+    try:
+        allocator.ascend_host_allocation = allocation
+        allocator.numa_mapping = None
+        allocator.use_hugepages = False
+        allocator.align_bytes = align_bytes
+        allocator.shm_name = None
+        allocator.size = allocation.size
+        allocator.buffer = allocation.buffer
+        allocator.pin_allocator = mixed.TensorMemoryAllocator(
+            allocator.buffer, align_bytes=align_bytes
+        )
+        allocator.host_mem_lock = threading.Lock()
+        allocator.buffer_allocator = mixed.BufferAllocator("cpu")
+        return allocator
+    except BaseException:
+        try:
+            allocation.release()
+        except Exception:
+            logger.exception(
+                "Failed to release ACL Host allocation at %s", allocation.raw_ptr
+            )
+        raise
+
+
+def make_mixed_close(
+    original_close: Callable[[MixedMemoryAllocator], None],
+) -> Callable[[MixedMemoryAllocator], None]:
+    """Make a close adapter without installing it on MixedMemoryAllocator.
+
+    Ordinary instances retain their original close. ACL instances synchronize
+    local device work before releasing the pool through its saved free function.
+    The caller must already have ended communication use: device synchronization
+    alone does not drain HIXL or remote accesses. Close is sequential, not a
+    concurrent release protocol.
+    """
+
+    def close(allocator: MixedMemoryAllocator) -> None:
+        allocation = getattr(allocator, "ascend_host_allocation", None)
+        if allocation is None:
+            original_close(allocator)
+            return
+        if allocation.released:
+            return
+
+        # Third Party
+        from lmcache.v1.memory_allocators import mixed_memory_allocator as mixed
+
+        if mixed.torch_dev.is_available():
+            mixed.torch_dev.synchronize()
+        allocation.release()
+
+    return close
