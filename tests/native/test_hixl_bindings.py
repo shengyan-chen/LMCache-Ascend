@@ -105,3 +105,44 @@ def test_unrelated_cpp_errors_are_not_hixl_errors(binding):
     with pytest.raises(RuntimeError, match="external C\\+\\+ failure") as caught:
         invoke(module, "connect")
     assert not isinstance(caught.value, module.HixlError)
+
+
+def test_acl_device_and_context_roundtrip_keeps_gil(binding):
+    module, control = binding
+    control.set_device(3)
+    assert module.get_current_device() == 3
+    assert module.get_current_context() == 0x4000
+    assert module.set_current_context(0x8000) is None
+    assert module.get_current_context() == 0x8000
+    assert control.calls() == [
+        ("aclrtGetDevice", True),
+        ("aclrtGetCurrentContext", True),
+        ("aclrtSetCurrentContext", True),
+        ("aclrtGetCurrentContext", True),
+    ]
+
+
+@pytest.mark.parametrize("code,ptr", [(0, 0), (107002, 0x4000)])
+def test_only_explicit_empty_context_becomes_none(binding, code, ptr):
+    module, control = binding
+    control.set_context(ptr)
+    control.set_acl_error("aclrtGetCurrentContext", code)
+    assert module.get_current_context() is None
+
+
+@pytest.mark.parametrize(
+    "method,operation,args",
+    [
+        ("get_current_device", "aclrtGetDevice", ()),
+        ("get_current_context", "aclrtGetCurrentContext", ()),
+        ("set_current_context", "aclrtSetCurrentContext", (0x8000,)),
+    ],
+)
+def test_acl_errors_stay_plain_runtimeerror(binding, method, operation, args):
+    module, control = binding
+    control.set_acl_error(operation, 123456)
+    control.fail_set_context(0x8000, 123456)
+    with pytest.raises(RuntimeError) as caught:
+        getattr(module, method)(*args)
+    assert type(caught.value) is RuntimeError
+    assert operation in str(caught.value) and "123456" in str(caught.value)

@@ -38,6 +38,14 @@ void check_status(hixl::Status status, const std::string &operation) {
     throw HixlCallError(status, operation);
   }
 }
+
+void check_acl_status(aclError status, const char *operation) {
+  if (status != ACL_SUCCESS) {
+    throw std::runtime_error(
+        std::string(operation) +
+        " failed | ACL Error Code: " + std::to_string(status));
+  }
+}
 } // namespace
 
 PYBIND11_MODULE(hixl_npu_comms, m) {
@@ -60,6 +68,40 @@ PYBIND11_MODULE(hixl_npu_comms, m) {
       PyErr_SetObject(hixl_error.ptr(), instance.ptr());
     }
   });
+
+  m.def(
+      "get_current_device",
+      [] {
+        int32_t device = -1;
+        check_acl_status(aclrtGetDevice(&device), "aclrtGetDevice");
+        return device;
+      },
+      "Get the current thread's ACL logical device ID.");
+
+  m.def(
+      "get_current_context",
+      []() -> py::object {
+        aclrtContext context = nullptr;
+        aclError result = aclrtGetCurrentContext(&context);
+        if (result == ACL_ERROR_RT_CONTEXT_NULL) {
+          return py::none();
+        }
+        check_acl_status(result, "aclrtGetCurrentContext");
+        if (context == nullptr) {
+          return py::none();
+        }
+        return py::int_(reinterpret_cast<uintptr_t>(context));
+      },
+      "Borrow the current thread's ACL context; return None if absent.");
+
+  m.def(
+      "set_current_context",
+      [](uintptr_t context) {
+        check_acl_status(
+            aclrtSetCurrentContext(reinterpret_cast<aclrtContext>(context)),
+            "aclrtSetCurrentContext");
+      },
+      py::arg("context"), "Set a borrowed ACL context on the current thread.");
 
   m.def(
       "is_device_memory",
