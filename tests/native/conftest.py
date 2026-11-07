@@ -11,7 +11,6 @@ import sys
 import sysconfig
 
 # Third Party
-import pybind11
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +25,9 @@ def load_extension(name, path):
 
 
 def build_extension(output_dir, name, sources, includes=()):
+    pybind11 = pytest.importorskip(
+        "pybind11", reason="Native boundary tests require it"
+    )
     output = output_dir / (name + sysconfig.get_config_var("EXT_SUFFIX"))
     command = shlex.split(os.environ.get("CXX", "c++")) + [
         "-std=c++17",
@@ -49,7 +51,10 @@ def build_extension(output_dir, name, sources, includes=()):
 
 @pytest.fixture(scope="session")
 def hixl_extension(tmp_path_factory):
-    include = Path(os.environ["HIXL_INCLUDE_DIR"])
+    include_path = os.environ.get("HIXL_INCLUDE_DIR")
+    if not include_path:
+        pytest.skip("Set HIXL_INCLUDE_DIR to run native HIXL boundary tests")
+    include = Path(include_path)
     output = build_extension(
         tmp_path_factory.mktemp("hixl-binding"),
         "hixl_npu_comms",
@@ -67,3 +72,19 @@ def binding(hixl_extension):
     module, control = hixl_extension
     control.reset()
     return module, control
+
+
+@pytest.fixture(scope="session")
+def host_extension(tmp_path_factory):
+    output = build_extension(
+        tmp_path_factory.mktemp("host-alloc"),
+        "_host_alloc_test",
+        [ROOT / "csrc/mem_alloc.cpp", STUBS / "host_alloc.cpp"],
+    )
+    return load_extension("_host_alloc_test", output)
+
+
+@pytest.fixture
+def host_alloc(host_extension):
+    host_extension.reset()
+    return host_extension

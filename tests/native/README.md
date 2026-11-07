@@ -21,6 +21,19 @@ Set `CXX` if the default compiler is unavailable. Build artifacts live in
 pytest's temporary directory. The substitutes are never used by the
 production CMake build.
 
+Without `HIXL_INCLUDE_DIR`, HIXL tests skip and Host allocation tests remain
+available. Without `pybind11`, native builds skip instead of failing test
+collection. An explicitly configured bad include path or a compiler error
+still fails the tests.
+
+The allocation tests compile the real `mem_alloc.cpp` behind a small test
+wrapper, including the old mapped allocation paths. They check ACL calls,
+arguments, failure handling and GIL state. They do not compile the full
+PyTorch-dependent `c_ops` module. The NUMA shim only enables linking on macOS;
+these tests do not validate NUMA allocation. Context scope tests run the real
+Python helper against the compiled ACL substitute; PyTorch device selection
+is simulated.
+
 Still required in the target environment: build/import the installed
 `hixl_npu_comms` and `c_ops` with the actual CANN/HIXL libraries, then run
 the A3 single-device and subsequent MP integration regressions.
