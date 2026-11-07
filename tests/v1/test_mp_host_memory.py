@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only checks of MP host-memory selection and read-only validation."""
+"""CPU checks of MP host-memory selection, allocation and runtime ordering."""
 
 # Standard
 from pathlib import Path
@@ -238,7 +238,26 @@ def test_mixed_reuses_pool_and_closes_through_record(
     torch = pytest.importorskip("torch")
     memory = configs[1].l1_manager_configs[0].memory_config
     memory.align_bytes = 64
-    allocator = policy.create_acl_mixed_allocator(memory, "npu")
+    initialized = False
+
+    def initialize():
+        nonlocal initialized
+        initialized = True
+
+    allocate = native.alloc_host_ptr.side_effect
+
+    def allocate_after_init(size):
+        assert initialized, "ACL allocation must follow runtime initialization"
+        return allocate(size)
+
+    native.alloc_host_ptr.side_effect = allocate_after_init
+    device = SimpleNamespace(
+        init=initialize, is_available=lambda: True, synchronize=Mock()
+    )
+    monkeypatch.setattr(sys.modules["lmcache"], "torch_dev", device)
+    monkeypatch.setattr(sys.modules["lmcache"], "torch_device_type", "npu")
+    original_create = Mock(side_effect=AssertionError("unexpected default allocation"))
+    allocator = policy.make_mp_memory_allocator(original_create)(memory)
     assert isinstance(allocator, mixed_module.MixedMemoryAllocator)
     ptr = allocator.buffer.data_ptr()
     first = allocator.allocate(torch.Size([17]), torch.uint8)
@@ -249,7 +268,6 @@ def test_mixed_reuses_pool_and_closes_through_record(
     allocator.free(second)
     native.free_host_ptr.assert_not_called()
 
-    device = SimpleNamespace(is_available=lambda: True, synchronize=Mock())
     monkeypatch.setattr(mixed_module, "torch_dev", device)
     original_close = Mock(side_effect=AssertionError("ordinary close used for ACL"))
     close = policy.make_mixed_close(original_close)
@@ -298,3 +316,59 @@ def test_ordinary_mixed_close_delegates(policy):
     original_close = Mock()
     policy.make_mixed_close(original_close)(allocator)
     original_close.assert_called_once_with(allocator)
+
+
+def test_default_creation_delegates_without_runtime(policy, configs, monkeypatch):
+    monkeypatch.setenv(ENV, "default")
+    # The default path must not need even an import of lmcache's runtime.
+    monkeypatch.setitem(sys.modules, "lmcache", None)
+    memory = configs[1].l1_manager_configs[0].memory_config
+    memory.use_lazy = True
+    original_create = Mock()
+    allocator = policy.make_mp_memory_allocator(original_create)(memory)
+    assert allocator is original_create.return_value
+    original_create.assert_called_once_with(memory)
+
+
+@pytest.fixture
+def runtime_entry(policy, monkeypatch):
+    # Runtime boundary only; the successful case above uses the real Mixed path.
+    device = SimpleNamespace(init=Mock())
+    monkeypatch.setitem(
+        sys.modules,
+        "lmcache",
+        SimpleNamespace(torch_dev=device, torch_device_type="npu"),
+    )
+    create_acl = Mock(side_effect=AssertionError("allocation must not be reached"))
+    monkeypatch.setattr(policy, "create_acl_mixed_allocator", create_acl)
+    original_create = Mock(side_effect=AssertionError("fallback must not be reached"))
+    return policy.make_mp_memory_allocator(original_create), device, create_acl
+
+
+def test_invalid_alignment_rejected_before_runtime(runtime_entry, configs):
+    create, device, create_acl = runtime_entry
+    memory = configs[1].l1_manager_configs[0].memory_config
+    memory.align_bytes = 3
+    with pytest.raises(ValueError, match="align_bytes"):
+        create(memory)
+    device.init.assert_not_called()
+    create_acl.assert_not_called()
+
+
+def test_missing_runtime_init_rejected_before_allocation(runtime_entry, configs):
+    create, device, create_acl = runtime_entry
+    del device.init
+    with pytest.raises(RuntimeError, match="init"):
+        create(configs[1].l1_manager_configs[0].memory_config)
+    create_acl.assert_not_called()
+
+
+def test_runtime_init_failure_preserved_without_allocation(runtime_entry, configs):
+    create, device, create_acl = runtime_entry
+    error = RuntimeError("NPU initialization failed")
+    device.init.side_effect = error
+    with pytest.raises(RuntimeError) as caught:
+        create(configs[1].l1_manager_configs[0].memory_config)
+    assert caught.value is error
+    device.init.assert_called_once_with()
+    create_acl.assert_not_called()

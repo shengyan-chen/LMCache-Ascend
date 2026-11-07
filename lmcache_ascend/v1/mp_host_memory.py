@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Configuration and allocator helpers for the opt-in MP L1 ACL Host path.
 
-This module neither installs patches nor initializes the NPU runtime. Call
+Importing this module neither installs patches nor initializes the NPU runtime.
+The creation wrapper prepares the runtime only for the selected ACL path. Call
 the MP validator before the server's SHM capacity fallback and L1 creation.
 """
 
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
         StorageManagerConfig,
     )
     from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
+    from lmcache.v1.memory_management import MemoryAllocatorInterface
     from lmcache.v1.multiprocess.config import MPServerConfig
 
 _ALLOCATOR_ENV = "LMCACHE_ASCEND_MP_HOST_MEMORY_ALLOCATOR"
@@ -73,6 +75,9 @@ def validate_acl_l1_config(
         raise ValueError("aclrt_malloc_host does not support use_hugepages")
     if config.devdax_path:
         raise ValueError("aclrt_malloc_host does not support devdax_path")
+    align_bytes = config.align_bytes
+    if align_bytes <= 0 or align_bytes & (align_bytes - 1) != 0:
+        raise ValueError("align_bytes must be a positive power of two")
 
 
 def validate_mp_host_memory_config(
@@ -111,6 +116,38 @@ def validate_mp_host_memory_config(
         )
 
 
+def make_mp_memory_allocator(
+    original_create: Callable[[L1MemoryManagerConfig], MemoryAllocatorInterface],
+) -> Callable[[L1MemoryManagerConfig], MemoryAllocatorInterface]:
+    """Make an MP L1 creation wrapper without installing any patches.
+
+    Default selections delegate without importing the runtime. ACL selections
+    validate first, require public runtime initialization, then create Mixed.
+    Initialization failures propagate without allocation or fallback. The
+    runtime owns initialization state; no device selection or finalization is
+    performed here, and HIXL thread-context preparation remains separate.
+
+    Before using this wrapper, the installer must install the Mixed close
+    adapter and arrange MP-wide validation ahead of SHM capacity fallback.
+    """
+
+    def create(config: L1MemoryManagerConfig) -> MemoryAllocatorInterface:
+        if get_mp_host_memory_allocator() == "default":
+            return original_create(config)
+
+        # Third Party
+        from lmcache import torch_dev, torch_device_type
+
+        validate_acl_l1_config(config, torch_device_type)
+        initialize = getattr(torch_dev, "init", None)
+        if not callable(initialize):
+            raise RuntimeError("aclrt_malloc_host requires callable torch_dev.init()")
+        initialize()
+        return create_acl_mixed_allocator(config, torch_device_type)
+
+    return create
+
+
 def create_acl_mixed_allocator(
     config: L1MemoryManagerConfig, device_type: str
 ) -> MixedMemoryAllocator:
@@ -123,8 +160,6 @@ def create_acl_mixed_allocator(
     """
     validate_acl_l1_config(config, device_type)
     align_bytes = config.align_bytes
-    if align_bytes <= 0 or align_bytes & (align_bytes - 1) != 0:
-        raise ValueError("align_bytes must be a positive power of two")
 
     # Third Party
     from lmcache.v1.memory_allocators import mixed_memory_allocator as mixed
