@@ -19,15 +19,47 @@
 
 namespace py = pybind11;
 
-static void check_status(hixl::Status status, const std::string &error_msg) {
+namespace {
+// C++ data only: safe to throw while the GIL is released. Python exception
+// construction happens in the module-local translator after stack unwinding.
+class HixlCallError : public std::runtime_error {
+public:
+  HixlCallError(hixl::Status code, const std::string &operation)
+      : std::runtime_error("HIXL " + operation + " failed | HIXL Error Code: " +
+                           std::to_string(code)),
+        code(code), operation(operation) {}
+
+  const hixl::Status code;
+  const std::string operation;
+};
+
+void check_status(hixl::Status status, const std::string &operation) {
   if (status != hixl::SUCCESS) {
-    throw std::runtime_error(error_msg +
-                             " | HIXL Error Code: " + std::to_string(status));
+    throw HixlCallError(status, operation);
   }
 }
+} // namespace
 
 PYBIND11_MODULE(hixl_npu_comms, m) {
   m.doc() = "pybind11 wrapper for HIXL low-level transfer engine";
+
+  // Let pybind11 manage the exception type's lifetime. The custom translator
+  // runs before its message-only translator and preserves the native fields.
+  static auto &hixl_error = py::register_local_exception<HixlCallError>(
+      m, "HixlError", PyExc_RuntimeError);
+  py::register_local_exception_translator([](std::exception_ptr error) {
+    if (!error) {
+      return;
+    }
+    try {
+      std::rethrow_exception(error);
+    } catch (const HixlCallError &e) {
+      auto instance = py::reinterpret_borrow<py::object>(hixl_error)(e.what());
+      instance.attr("code") = e.code;
+      instance.attr("operation") = e.operation;
+      PyErr_SetObject(hixl_error.ptr(), instance.ptr());
+    }
+  });
 
   m.def(
       "is_device_memory",
@@ -74,6 +106,17 @@ PYBIND11_MODULE(hixl_npu_comms, m) {
   m.attr("UNSUPPORTED") = hixl::UNSUPPORTED;
   m.attr("FAILED") = hixl::FAILED;
   m.attr("RESOURCE_EXHAUSTED") = hixl::RESOURCE_EXHAUSTED;
+
+  // Unambiguous return codes; legacy TIMEOUT/FAILED exports below remain enums.
+  m.attr("HIXL_SUCCESS") = hixl::SUCCESS;
+  m.attr("HIXL_PARAM_INVALID") = hixl::PARAM_INVALID;
+  m.attr("HIXL_TIMEOUT") = hixl::TIMEOUT;
+  m.attr("HIXL_NOT_CONNECTED") = hixl::NOT_CONNECTED;
+  m.attr("HIXL_ALREADY_CONNECTED") = hixl::ALREADY_CONNECTED;
+  m.attr("HIXL_NOTIFY_FAILED") = hixl::NOTIFY_FAILED;
+  m.attr("HIXL_UNSUPPORTED") = hixl::UNSUPPORTED;
+  m.attr("HIXL_FAILED") = hixl::FAILED;
+  m.attr("HIXL_RESOURCE_EXHAUSTED") = hixl::RESOURCE_EXHAUSTED;
 
   py::enum_<hixl::MemType>(m, "MemType")
       .value("MEM_DEVICE", hixl::MEM_DEVICE)
@@ -126,7 +169,7 @@ PYBIND11_MODULE(hixl_npu_comms, m) {
             }
             check_status(self.Initialize(
                              hixl::AscendString(local_engine.c_str()), options),
-                         "HIXL Initialize failed");
+                         "Initialize");
           },
           py::arg("local_engine"),
           py::arg("options") = std::map<std::string, std::string>{})
@@ -138,38 +181,51 @@ PYBIND11_MODULE(hixl_npu_comms, m) {
             desc.addr = addr;
             desc.len = len;
             hixl::MemHandle handle = nullptr;
-            check_status(self.RegisterMem(desc, type, handle),
-                         "HIXL RegisterMem failed");
+            hixl::Status result;
+            {
+              py::gil_scoped_release release;
+              result = self.RegisterMem(desc, type, handle);
+            }
+            check_status(result, "RegisterMem");
             return reinterpret_cast<uintptr_t>(handle);
           },
           py::arg("addr"), py::arg("len"), py::arg("type"))
       .def(
           "deregister_mem",
           [](hixl::Hixl &self, uintptr_t handle) {
-            check_status(
-                self.DeregisterMem(reinterpret_cast<hixl::MemHandle>(handle)),
-                "HIXL DeregisterMem failed");
+            hixl::Status result;
+            {
+              py::gil_scoped_release release;
+              result =
+                  self.DeregisterMem(reinterpret_cast<hixl::MemHandle>(handle));
+            }
+            check_status(result, "DeregisterMem");
           },
           py::arg("handle"))
       .def(
           "connect",
           [](hixl::Hixl &self, const std::string &remote_engine,
              int32_t timeout_ms) {
-            py::gil_scoped_release release;
-            check_status(self.Connect(hixl::AscendString(remote_engine.c_str()),
-                                      timeout_ms),
-                         "HIXL Connect failed");
+            hixl::Status result;
+            {
+              py::gil_scoped_release release;
+              result = self.Connect(hixl::AscendString(remote_engine.c_str()),
+                                    timeout_ms);
+            }
+            check_status(result, "Connect");
           },
           py::arg("remote_engine"), py::arg("timeout_ms") = 30000)
       .def(
           "disconnect",
           [](hixl::Hixl &self, const std::string &remote_engine,
              int32_t timeout_ms) {
-            py::gil_scoped_release release;
-            check_status(
-                self.Disconnect(hixl::AscendString(remote_engine.c_str()),
-                                timeout_ms),
-                "HIXL Disconnect failed");
+            hixl::Status result;
+            {
+              py::gil_scoped_release release;
+              result = self.Disconnect(
+                  hixl::AscendString(remote_engine.c_str()), timeout_ms);
+            }
+            check_status(result, "Disconnect");
           },
           py::arg("remote_engine"), py::arg("timeout_ms") = 5000)
       .def(
@@ -182,7 +238,7 @@ PYBIND11_MODULE(hixl_npu_comms, m) {
             check_status(
                 self.TransferSync(hixl::AscendString(remote_engine.c_str()), op,
                                   op_descs, timeout_ms),
-                "HIXL TransferSync failed");
+                "TransferSync");
           },
           py::arg("remote_engine"), py::arg("op"), py::arg("op_descs"),
           py::arg("timeout_ms") = 30000)
@@ -193,10 +249,14 @@ PYBIND11_MODULE(hixl_npu_comms, m) {
              const std::vector<hixl::TransferOpDesc> &op_descs) {
             hixl::TransferArgs args{};
             hixl::TransferReq req = nullptr;
-            check_status(
-                self.TransferAsync(hixl::AscendString(remote_engine.c_str()),
-                                   op, op_descs, args, req),
-                "HIXL TransferAsync failed");
+            hixl::Status result;
+            {
+              py::gil_scoped_release release;
+              result =
+                  self.TransferAsync(hixl::AscendString(remote_engine.c_str()),
+                                     op, op_descs, args, req);
+            }
+            check_status(result, "TransferAsync");
             return reinterpret_cast<uintptr_t>(req);
           },
           py::arg("remote_engine"), py::arg("op"), py::arg("op_descs"))
@@ -204,9 +264,13 @@ PYBIND11_MODULE(hixl_npu_comms, m) {
           "get_transfer_status",
           [](hixl::Hixl &self, uintptr_t req) {
             hixl::TransferStatus status;
-            check_status(self.GetTransferStatus(
-                             reinterpret_cast<hixl::TransferReq>(req), status),
-                         "HIXL GetTransferStatus failed");
+            hixl::Status result;
+            {
+              py::gil_scoped_release release;
+              result = self.GetTransferStatus(
+                  reinterpret_cast<hixl::TransferReq>(req), status);
+            }
+            check_status(result, "GetTransferStatus");
             return status;
           },
           py::arg("req"));
