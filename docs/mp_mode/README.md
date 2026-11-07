@@ -13,6 +13,41 @@ The data plane has two transfer modes, selected with the `lmcache.mp.mp_transfer
 
 On NPU, leaving `lmcache.mp.mp_transfer_mode` unset (or `auto`) resolves to `lmcache_driven`, so DeepSeek-V4 needs no extra setting; to use `engine_driven` you must set it explicitly.
 
+## Opt-in pure ACL Host memory for MP L1
+
+The experimental pure ACL path uses `aclrtMallocHost` / `aclrtFreeHost`
+without the Host mapping performed by the existing pinned allocation path.
+It keeps the upstream Mixed allocator's object management and uses the raw
+allocation address, without adding base-address alignment or padding.
+
+Use the explicit Ascend entry point to install the MP memory hooks before
+starting the upstream server:
+
+```bash
+LMCACHE_ASCEND_MP_HOST_MEMORY_ALLOCATOR=aclrt_malloc_host \
+python -m lmcache_ascend.v1.mp_server \
+    --supported-transfer-mode lmcache_driven \
+    --no-l1-use-lazy --shm-name "" --l1-size-gb 1
+```
+
+Pass the same options as `lmcache server`, without the `server` subcommand.
+The entry point delegates argument parsing, HTTP/MP services and shutdown to
+the upstream CLI. It validates the effective MP L1 configuration before SHM
+capacity fallback, prepares the NPU runtime before ACL allocation, and installs
+the matching Mixed close adapter. Configure the environment before startup.
+
+This path requires NPU, non-Lazy DRAM L1, and no SHM, hugepages or devdax/GDS
+backing. It does not support NUMA allocation. Allocation/initialization failures
+are reported without falling back to the existing pinned path. With the variable
+unset or set to `default`, the entry point leaves upstream functions unchanged.
+Setting the variable alone does **not** install the hooks when using the original
+`lmcache server` or `python -m lmcache.v1.multiprocess.server` commands.
+
+This is the memory adaptation only; it does not enable a direct HIXL transfer
+channel. CPU tests cover the wiring and memory lifecycle with native boundaries
+substituted. Target CANN loading, NPU cold start, local transfers and HIXL
+registration/transfer coexistence still require A3 validation.
+
 ## Supported models and limitations
 
 **Supported in MP mode (both transfer modes, where the format applies):**

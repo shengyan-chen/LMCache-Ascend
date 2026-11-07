@@ -11,6 +11,7 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Callable
+from functools import wraps
 from typing import TYPE_CHECKING, Literal
 import logging
 import os
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
     from lmcache.v1.multiprocess.config import MPServerConfig
 
 _ALLOCATOR_ENV = "LMCACHE_ASCEND_MP_HOST_MEMORY_ALLOCATOR"
+_MP_HOST_MEMORY_INSTALLED = False
 logger = logging.getLogger(__name__)
 
 
@@ -221,3 +223,46 @@ def make_mixed_close(
         allocation.release()
 
     return close
+
+
+def install_mp_host_memory() -> None:
+    """Install the opt-in MP hooks after imports finish, before server startup.
+
+    Called explicitly by the Ascend MP entry point, never during Ascend package
+    activation. The selection must be configured before this call. Default
+    leaves upstream functions untouched. Installation is sequential and
+    idempotent; it neither initializes the runtime nor allocates memory.
+
+    Wrap the canonical server module's _start_cache_server so existing references
+    to run_cache_server still enter validation before SHM fallback. Running the
+    upstream server module separately as __main__ is not this entry point.
+    """
+    global _MP_HOST_MEMORY_INSTALLED
+    if get_mp_host_memory_allocator() == "default" or _MP_HOST_MEMORY_INSTALLED:
+        return
+
+    # Third Party
+    from lmcache.v1.distributed.memory_manager import l1_memory_manager
+    from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
+    from lmcache.v1.multiprocess import server
+
+    original_start = server._start_cache_server
+    close = make_mixed_close(MixedMemoryAllocator.close)
+    create = make_mp_memory_allocator(l1_memory_manager.create_memory_allocator)
+
+    @wraps(original_start)
+    def start(mp_config, storage_manager_config, *args, **kwargs):
+        # Third Party
+        from lmcache import torch_device_type
+
+        validate_mp_host_memory_config(
+            mp_config, storage_manager_config, torch_device_type
+        )
+        return original_start(mp_config, storage_manager_config, *args, **kwargs)
+
+    # Build all wrappers before changing references; close must be ready before
+    # an ACL Mixed instance can be created. Install before any server threads.
+    MixedMemoryAllocator.close = close
+    l1_memory_manager.create_memory_allocator = create
+    server._start_cache_server = start
+    _MP_HOST_MEMORY_INSTALLED = True

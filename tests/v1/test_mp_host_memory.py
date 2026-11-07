@@ -372,3 +372,89 @@ def test_runtime_init_failure_preserved_without_allocation(runtime_entry, config
     assert caught.value is error
     device.init.assert_called_once_with()
     create_acl.assert_not_called()
+
+
+def test_default_installation_leaves_runtime_unloaded(policy, monkeypatch):
+    monkeypatch.delenv(ENV, raising=False)
+    monkeypatch.setitem(sys.modules, "lmcache", None)
+    policy.install_mp_host_memory()
+
+
+@pytest.fixture
+def install_targets(mixed_module, monkeypatch):
+    # Stub only the server/L1 module boundaries; use the real Mixed class below.
+    l1 = ModuleType("l1_memory_manager")
+    l1.create_memory_allocator = Mock(side_effect=AssertionError("default allocation"))
+    server = ModuleType("server")
+    server._start_cache_server = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "lmcache.v1.distributed.memory_manager",
+        SimpleNamespace(l1_memory_manager=l1),
+    )
+    monkeypatch.setitem(
+        sys.modules, "lmcache.v1.multiprocess", SimpleNamespace(server=server)
+    )
+    device = SimpleNamespace(init=Mock(), is_available=lambda: True, synchronize=Mock())
+    monkeypatch.setattr(sys.modules["lmcache"], "torch_device_type", "npu")
+    monkeypatch.setattr(sys.modules["lmcache"], "torch_dev", device)
+    monkeypatch.setattr(mixed_module, "torch_dev", device)
+    # Register restoration before the installer changes the shared class method.
+    monkeypatch.setattr(
+        mixed_module.MixedMemoryAllocator,
+        "close",
+        mixed_module.MixedMemoryAllocator.close,
+    )
+    return server, l1, device
+
+
+def test_installed_path_creates_and_closes_acl_pool_once(
+    policy, configs, host_memory, install_targets, mixed_module
+):
+    _, native, backing = host_memory
+    server, l1, device = install_targets
+    mp, storage = configs
+    memory = storage.l1_manager_configs[0].memory_config
+    server._start_cache_server.side_effect = lambda *args, **kwargs: (
+        l1.create_memory_allocator(memory)
+    )
+    original_start = server._start_cache_server
+    policy.install_mp_host_memory()
+    installed = (
+        server._start_cache_server,
+        l1.create_memory_allocator,
+        mixed_module.MixedMemoryAllocator.close,
+    )
+    policy.install_mp_host_memory()
+    assert installed == (
+        server._start_cache_server,
+        l1.create_memory_allocator,
+        mixed_module.MixedMemoryAllocator.close,
+    )
+    allocator = server._start_cache_server(mp, storage, "observability", enabled=True)
+    original_start.assert_called_once_with(mp, storage, "observability", enabled=True)
+    device.init.assert_called_once_with()
+    assert isinstance(allocator, mixed_module.MixedMemoryAllocator)
+    ptr = allocator.buffer.data_ptr()
+    allocator.close()
+    assert not backing
+    native.free_host_ptr.assert_called_once_with(ptr)
+
+
+def test_installed_validation_precedes_shm_fallback(policy, configs, install_targets):
+    server, _, device = install_targets
+    mp, storage = configs
+    memory = storage.l1_manager_configs[0].memory_config
+    mp.shm_name = "lmcache_l1_pool_conflict"
+
+    def fallback(*args, **kwargs):
+        memory.shm_name = ""
+
+    server._start_cache_server.side_effect = fallback
+    original_start = server._start_cache_server
+    policy.install_mp_host_memory()
+    with pytest.raises(ValueError, match="shm_name"):
+        server._start_cache_server(mp_config=mp, storage_manager_config=storage)
+    original_start.assert_not_called()
+    device.init.assert_not_called()
+    assert mp.shm_name == "lmcache_l1_pool_conflict"
