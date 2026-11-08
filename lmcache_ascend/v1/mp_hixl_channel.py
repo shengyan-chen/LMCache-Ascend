@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """MP HIXL lifecycle, peer admission and asynchronous READ task management.
 
-Explicit fault recovery and public factory integration are not implemented yet.
+Public factory integration is not implemented yet.
 """
 
 # Future
@@ -654,7 +654,12 @@ class HixlTransferChannelContext:
         self._disconnect_connection_locked(record)
 
     def _ensure_connection(self, metadata: HixlChannelMetadata) -> _HixlConnection:
-        """Validate, reuse or connect under one engine lock; never hot-replace."""
+        """Reuse or explicitly reconnect the same peer after confirmed cleanup.
+
+        Failed records stay with old Clients and tasks. Publish a fresh record
+        only after Connect succeeds; never replace a different peer instance.
+        Callers coordinate old Client removal; this is not a holder/drain check.
+        """
         # First Party
         from lmcache_ascend.v1.hixl_runtime import use_acl_context
 
@@ -669,15 +674,19 @@ class HixlTransferChannelContext:
                 ):
                     if record.metadata != metadata:
                         raise ValueError("Conflicting HIXL peer metadata")
-                    if not record.connected:
+                    if record.connected:
+                        return record
+                    if record.failure is None or not record.disconnect_succeeded:
                         raise RuntimeError("HIXL peer connection is not reusable")
-                    return record
+                    # Keep the old fault/cleanup evidence if Connect fails.
+                    # Never revive it: other Clients may still hold old tasks.
+                    break
             record = _HixlConnection(metadata)
             with use_acl_context(self._acl_context):
                 self._engine.connect(
                     metadata.engine_id, timeout_ms=self._config.connect_timeout_ms
                 )
-            # ALREADY_CONNECTED with no matching record propagates as HixlError;
+            # ALREADY_CONNECTED cannot certify a new or recovered connection;
             # known reusable records returned above without another native call.
             self._connections[metadata.engine_id] = record
             return record

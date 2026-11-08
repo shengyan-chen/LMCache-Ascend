@@ -382,8 +382,11 @@ def test_duplicate_clients_share_connection_and_identity_conflicts_are_rejected(
     discarded = next(candidate for candidate, _ in results if candidate is not first)
     assert discarded.closed and discarded.connection is first.connection
     context.remove_transfer_channel_client(peer.advertise_url)
+    first.connection.connected = False
+    first.connection.failure = "query failed"
+    first.connection.disconnect_succeeded = True
     # Removing a logical Client must not permit a restarted peer to replace
-    # retained physical connection identity, including a changed engine ID.
+    # retained identity, even after successful fault cleanup.
     changed = msgspec.structs.replace(
         peer,
         engine_id="10.0.0.12:6001",
@@ -742,6 +745,10 @@ def test_query_fault_affects_shared_record_and_exit_handles_cleanup(
     if cleanup_fails:
         assert "fault cleanup failed" in client.connection.disconnect_error
         assert "fault cleanup failed" in caplog.text
+        connects = engine.connect.call_count
+        with pytest.raises(RuntimeError, match="not reusable"):
+            context._ensure_connection(client.peer_metadata)
+        assert engine.connect.call_count == connects
     with pytest.raises(KeyError):
         client.query_read_status(task)
     result = sibling.query_read_status(affected)
@@ -848,4 +855,94 @@ def test_descriptor_count_cannot_truncate_to_uint32(backend, read_addresses):
     batch = OversizedBatch([address(0, 8)])
     with pytest.raises(ValueError, match="uint32"):
         client._build_read_descriptors(batch, batch)
+
+
+def test_explicit_readmission_keeps_old_tasks_on_failed_record(
+    backend, read_addresses, local_contexts
+):
+    module, native, _, state, _ = backend
+    _, _, address = read_addresses
+    a, engine_a = local_contexts()
+    b, engine_b = local_contexts()
+    old = a.get_transfer_channel_client(b.metadata.advertise_url)
+    sibling = module.HixlTransferChannelClient(a, old.connection)
+    requests = count(0x9000)
+    engine_a.transfer_async.side_effect = lambda *args: next(requests)
+    pair = [address(0, 8)]
+    failed = old.submit_read(pair, pair)
+    pending = sibling.submit_read(pair, pair)
+    engine_a.get_transfer_status.side_effect = native.HixlError(500)
+    with pytest.raises(native.HixlError):
+        old.query_read_status(failed)
+    record = old.connection
+    assert record.disconnect_succeeded
+    assert a.get_transfer_channel_client(b.metadata.advertise_url) is old
+    assert engine_a.connect.call_count == 1
+    a.remove_transfer_channel_client(b.metadata.advertise_url)
+
+    def reconnect(engine_id, timeout_ms):
+        assert a._engine_lock.locked() and state.context == 0x4000
+        assert (engine_id, timeout_ms) == (b.metadata.engine_id, 10000)
+        assert a._connections[engine_id] is record
+        state.context = 0x9000
+
+    engine_a.connect.side_effect = reconnect
+    new = a.get_transfer_channel_client(b.metadata.advertise_url)
+    assert old.closed and new is not old
+    assert new.connection is not record and new.peer_metadata == old.peer_metadata
+    assert a._connections[b.metadata.engine_id] is new.connection
+    assert record.failure is not None and not record.connected
+    assert sibling.query_read_status(pending).succeeded_mask == [False]
+    with pytest.raises(RuntimeError, match="not usable"):
+        sibling.submit_read(pair, pair)
+    engine_a.get_transfer_status.assert_called_once_with(0x9000)
+    engine_a.get_transfer_status.side_effect = None
+    engine_a.get_transfer_status.return_value = native.TransferStatus.COMPLETED
+    task = new.submit_read(pair, pair)
+    assert new.query_read_status(task).succeeded_mask == [True]
+    engine_a.get_transfer_status.assert_called_with(0x9002)
+    assert engine_a.connect.call_count == 2
+    engine_b.connect.assert_called_once()  # Reverse admission reuses its live record.
+    a.close()
+    assert engine_a.disconnect.call_count == 2  # Fault record, then new connection.
+    assert state.context == 0x4000
+
+
+def test_readmission_rejects_unconfirmed_disconnect(backend, read_tasks):
+    _, native, _, _, _ = backend
+    context, client, _ = read_tasks
+    engine = native.Hixl.return_value
+    engine.disconnect.side_effect = native.HixlError(native.HIXL_NOT_CONNECTED)
+    with context._engine_lock:
+        context._fail_connection_locked(client.connection, native.HixlError(500))
+    context.remove_transfer_channel_client(client.peer_metadata.advertise_url)
+    diagnostic = client.connection.disconnect_error
+    assert diagnostic is not None and not client.connection.disconnect_succeeded
+    with pytest.raises(RuntimeError, match="not reusable"):
+        context._ensure_connection(client.peer_metadata)
+    assert context._connections[client.peer_metadata.engine_id] is client.connection
+    assert client.connection.disconnect_error == diagnostic
+    engine.connect.assert_not_called()
+    engine.disconnect.assert_called_once()  # Admission does not retry cleanup.
+
+
+def test_failed_readmission_preserves_old_record(backend, read_tasks):
+    _, native, _, _, _ = backend
+    context, client, _ = read_tasks
+    engine = native.Hixl.return_value
+    with context._engine_lock:
+        context._fail_connection_locked(client.connection, native.HixlError(500))
+    context.remove_transfer_channel_client(client.peer_metadata.advertise_url)
+    error = native.HixlError(native.HIXL_ALREADY_CONNECTED)
+    engine.connect.side_effect = error
+    with pytest.raises(native.HixlError) as caught:
+        context._ensure_connection(client.peer_metadata)
+    assert caught.value is error
+    assert context._connections[client.peer_metadata.engine_id] is client.connection
+    assert client.connection.failure is not None and not client.connection.connected
+    assert client.connection.disconnect_succeeded
+    assert context.get_num_connected_clients() == 0
+    engine.connect.assert_called_once_with(
+        client.peer_metadata.engine_id, timeout_ms=10000
+    )
     native.Hixl.return_value.transfer_async.assert_not_called()
