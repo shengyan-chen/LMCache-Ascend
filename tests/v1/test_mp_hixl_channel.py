@@ -3,6 +3,7 @@
 
 # Standard
 from concurrent.futures import ThreadPoolExecutor
+from itertools import count
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -59,6 +60,8 @@ def backend(monkeypatch):
     native.HixlError = HixlError
     native.HIXL_ALREADY_CONNECTED = 100
     native.HIXL_NOT_CONNECTED = 101
+    native.TransferOp = SimpleNamespace(READ=0)
+    native.TransferStatus = SimpleNamespace(WAITING=0, COMPLETED=1, TIMEOUT=2, FAILED=3)
     native.MEM_HOST = 1
     native.Hixl = Mock(return_value=Mock())
     native.Hixl.return_value.register_mem.return_value = 0x5678
@@ -609,3 +612,240 @@ def test_later_remote_range_error_rejects_batch_without_transfer(
             [address(0, 128), address(960, 128)],
         )
     assert native.Hixl.return_value.mock_calls == []
+
+
+@pytest.fixture
+def read_tasks(backend, read_addresses):
+    _, native, _, _, _ = backend
+    context, client, address = read_addresses
+    context._connections[client.peer_metadata.engine_id] = client.connection
+    context.register_client(client.peer_metadata.advertise_url, client)
+    requests = count(0x9000)
+    native.Hixl.return_value.transfer_async.side_effect = lambda *a: next(requests)
+    return context, client, address
+
+
+@pytest.mark.parametrize("terminal,success", [("COMPLETED", True), ("FAILED", False)])
+def test_read_task_lifecycle_and_close(backend, read_tasks, terminal, success):
+    _, native, _, state, engine_lock = backend
+    context, client, address = read_tasks
+    engine = native.Hixl.return_value
+    local = [address(0, 7), address(16, 3)]
+    remote = [address(32, 7), address(64, 3)]
+
+    def submit(peer, op, descs):
+        assert client._lock.locked() and engine_lock.locked()
+        assert state.context == 0x4000
+        assert peer == "10.0.0.12:6000" and op == native.TransferOp.READ
+        assert [(d.local_addr, d.remote_addr, d.len) for d in descs] == [
+            (0x100003, 0x800025, 7),
+            (0x100013, 0x800045, 3),
+        ]
+        state.context = 0x8000
+        return 0x9000
+
+    states = iter(
+        [native.TransferStatus.WAITING, getattr(native.TransferStatus, terminal)]
+    )
+
+    def query(req):
+        assert req == 0x9000
+        assert client._lock.locked() and engine_lock.locked()
+        assert state.context == 0x4000
+        state.context = 0x8000
+        return next(states)
+
+    engine.transfer_async.side_effect = submit
+    engine.get_transfer_status.side_effect = query
+    task = client.submit_read(local, remote)
+    assert task != 0x9000
+    remote.clear()  # The result must use the saved batch, not this mutable list.
+    pending = client.query_read_status(task)
+    assert not pending.finished and pending.succeeded_mask == []
+    result = client.query_read_status(task)
+    assert result.finished and result.succeeded_mask == [success, success]
+    with pytest.raises(KeyError):
+        client.query_read_status(task)
+    assert engine.get_transfer_status.call_count == 2
+    engine.transfer_async.side_effect = None
+    engine.transfer_async.return_value = 0x9001
+    next_task = client.submit_read(local, local)
+    assert next_task > task
+    client.close()
+    with pytest.raises(KeyError):
+        client.query_read_status(next_task)
+    with pytest.raises(RuntimeError, match="closed"):
+        client.submit_read(local, local)
+    assert engine.transfer_async.call_count == 2
+    engine.disconnect.assert_not_called()
+    assert state.context == 0x4000
+
+
+@pytest.mark.parametrize("empty_handle", [False, True])
+def test_failed_submission_returns_no_task_or_query_fault(
+    backend, read_tasks, empty_handle
+):
+    _, native, _, _, _ = backend
+    _, client, address = read_tasks
+    engine = native.Hixl.return_value
+    error = native.HixlError(500)
+    engine.transfer_async.side_effect = None if empty_handle else error
+    engine.transfer_async.return_value = 0
+    with pytest.raises(RuntimeError) as caught:
+        client.submit_read([address(0, 8)], [address(0, 8)])
+    if not empty_handle:
+        assert caught.value is error
+    assert not client._tasks and client.connection.connected
+    engine.disconnect.assert_not_called()
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_query_fault_affects_shared_record_and_exit_handles_cleanup(
+    backend, read_tasks, cleanup_fails, caplog
+):
+    module, native, _, state, engine_lock = backend
+    context, client, address = read_tasks
+    engine = native.Hixl.return_value
+    sibling = module.HixlTransferChannelClient(context, client.connection)
+    other_meta = msgspec.structs.replace(
+        client.peer_metadata, engine_id="10.0.0.13:6000", advertise_url="10.0.0.13:5555"
+    )
+    other = module.HixlTransferChannelClient(
+        context, context._ensure_connection(other_meta)
+    )
+    context.register_client(other_meta.advertise_url, other)
+    pair = [address(0, 8)]
+    task = client.submit_read(pair, pair)
+    affected = sibling.submit_read(pair, pair)
+    unaffected = other.submit_read(pair, pair)
+    error = native.HixlError(500)
+
+    def query(req):
+        state.context = 0x8000
+        raise error
+
+    def disconnect(peer, timeout_ms):
+        assert engine_lock.locked() and state.context == 0x4000
+        assert timeout_ms == 1000
+        state.context = 0x8000
+        if cleanup_fails:
+            raise RuntimeError("fault cleanup failed")
+
+    engine.get_transfer_status.side_effect = query
+    engine.disconnect.side_effect = disconnect
+    with pytest.raises(native.HixlError) as caught:
+        client.query_read_status(task)
+    assert caught.value is error
+    assert not client.connection.connected
+    assert client.connection.failure is not None
+    assert client.connection.disconnect_succeeded is not cleanup_fails
+    if cleanup_fails:
+        assert "fault cleanup failed" in client.connection.disconnect_error
+        assert "fault cleanup failed" in caplog.text
+    with pytest.raises(KeyError):
+        client.query_read_status(task)
+    result = sibling.query_read_status(affected)
+    assert result.finished and result.succeeded_mask == [False]
+    with pytest.raises(KeyError):
+        sibling.query_read_status(affected)
+    with pytest.raises(RuntimeError):
+        sibling.submit_read(pair, pair)
+    assert engine.get_transfer_status.call_count == 1
+    engine.disconnect.assert_called_once_with("10.0.0.12:6000", timeout_ms=1000)
+    assert other.connection.connected
+    engine.get_transfer_status.side_effect = None
+    engine.get_transfer_status.return_value = native.TransferStatus.COMPLETED
+    assert other.query_read_status(unaffected).succeeded_mask == [True]
+    # Final exit gets one additional attempt only for unsuccessful fault cleanup.
+    engine.disconnect.side_effect = None
+    context.close()
+    context.close()
+    peer_calls = [
+        c for c in engine.disconnect.call_args_list if c.args[0] == "10.0.0.12:6000"
+    ]
+    assert len(peer_calls) == (2 if cleanup_fails else 1)
+    assert state.context == 0x4000
+
+
+def test_acl_preparation_failure_does_not_consume_or_fault_task(
+    backend, read_tasks, monkeypatch
+):
+    _, native, _, _, _ = backend
+    _, client, address = read_tasks
+    engine = native.Hixl.return_value
+    task = client.submit_read([address(0, 8)], [address(0, 8)])
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            native,
+            "set_current_context",
+            Mock(side_effect=RuntimeError("ACL prepare failed")),
+        )
+        with pytest.raises(RuntimeError, match="ACL prepare failed"):
+            client.query_read_status(task)
+    assert task in client._tasks and client.connection.connected
+    engine.get_transfer_status.assert_not_called()
+    engine.disconnect.assert_not_called()
+    engine.get_transfer_status.return_value = native.TransferStatus.COMPLETED
+    assert client.query_read_status(task).succeeded_mask == [True]
+
+
+def test_unsupported_nonwaiting_status_consumes_only_current_task(backend, read_tasks):
+    _, native, _, _, _ = backend
+    _, client, address = read_tasks
+    pair = [address(0, 8)]
+    task = client.submit_read(pair, pair)
+    engine = native.Hixl.return_value
+    engine.get_transfer_status.return_value = native.TransferStatus.TIMEOUT
+    with pytest.raises(RuntimeError, match="Unsupported"):
+        client.query_read_status(task)
+    with pytest.raises(KeyError):
+        client.query_read_status(task)
+    assert client.connection.connected
+    engine.disconnect.assert_not_called()
+    engine.get_transfer_status.assert_called_once()
+
+
+def test_concurrent_queries_consume_native_request_once(backend, read_tasks):
+    _, native, _, _, _ = backend
+    _, client, address = read_tasks
+    task = client.submit_read([address(0, 8)], [address(0, 8)])
+    entered = threading.Event()
+    release = threading.Event()
+    second_started = threading.Event()
+
+    def query(req):
+        entered.set()
+        assert release.wait(5)
+        return native.TransferStatus.COMPLETED
+
+    def second_query():
+        second_started.set()
+        return client.query_read_status(task)
+
+    native.Hixl.return_value.get_transfer_status.side_effect = query
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(client.query_read_status, task)
+        try:
+            assert entered.wait(5)
+            second = pool.submit(second_query)
+            assert second_started.wait(5)
+        finally:
+            release.set()
+        assert first.result(timeout=5).succeeded_mask == [True]
+        with pytest.raises(KeyError):
+            second.result(timeout=5)
+    native.Hixl.return_value.get_transfer_status.assert_called_once()
+
+
+def test_descriptor_count_cannot_truncate_to_uint32(backend, read_addresses):
+    _, native, _, _, _ = backend
+    _, client, address = read_addresses
+
+    class OversizedBatch(list):
+        def __len__(self):
+            return 1 << 32
+
+    batch = OversizedBatch([address(0, 8)])
+    with pytest.raises(ValueError, match="uint32"):
+        client._build_read_descriptors(batch, batch)
+    native.Hixl.return_value.transfer_async.assert_not_called()

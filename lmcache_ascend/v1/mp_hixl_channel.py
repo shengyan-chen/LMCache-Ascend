@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MP HIXL engine, L1 registration, metadata service and peer admission.
+"""MP HIXL lifecycle, peer admission and asynchronous READ task management.
 
-READ/task operations and public factory integration are not implemented yet.
+Explicit fault recovery and public factory integration are not implemented yet.
 """
 
 # Future
@@ -26,7 +26,10 @@ import zmq
 if TYPE_CHECKING:
     # Third Party
     from lmcache.v1.distributed.internal_api import L1MemoryDesc
-    from lmcache.v1.distributed.transfer_channel.api import TransferChannelAddress
+    from lmcache.v1.distributed.transfer_channel.api import (
+        TransferChannelAddress,
+        TransferChannelReadResult,
+    )
 
     # First Party
     from lmcache_ascend.hixl_npu_comms import TransferOpDesc
@@ -36,6 +39,7 @@ _ENV_PREFIX = "LMCACHE_HIXL_"
 _HANDSHAKE_TIMEOUT_MS = 60000
 _DISCONNECT_TIMEOUT_MS = 1000
 _INT32_MAX = (1 << 31) - 1
+_UINT32_MAX = (1 << 32) - 1
 _UINTPTR_MAX = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
 _SIZE_MAX = (1 << (ctypes.sizeof(ctypes.c_size_t) * 8)) - 1
 
@@ -206,14 +210,18 @@ class _HixlConnection:
     """Context-owned successful connection, independent of logical Clients."""
 
     metadata: HixlChannelMetadata
-    connected: bool = True
+    connected: bool = True  # Admission state, not a physical liveness probe.
+    failure: str | None = None
+    disconnect_succeeded: bool = False
+    disconnect_error: str | None = None
+    close_attempted: bool = False
 
 
 class HixlTransferChannelClient:
     """Borrow a shared connection and retain its immutable peer snapshot.
 
-    This stage supports lifecycle and READ parameter preparation. Submission
-    and task state follow separately; closing never disconnects the connection.
+    Tasks belong to this Client; a shared connection fault affects all of its
+    borrowers. Closing clears local tasks without disconnecting the connection.
     """
 
     def __init__(
@@ -224,6 +232,8 @@ class HixlTransferChannelClient:
         self.peer_metadata = connection.metadata
         self._lock = Lock()
         self._closed = False
+        self._task_counter = 0
+        self._tasks: dict[int, tuple[int, list[TransferChannelAddress]]] = {}
 
     def _build_read_descriptors(
         self,
@@ -241,6 +251,8 @@ class HixlTransferChannelClient:
             raise ValueError("Local and remote address count must match")
         if not local_addresses:
             raise ValueError("READ address batch must not be empty")
+        if len(local_addresses) > _UINT32_MAX:
+            raise ValueError("READ descriptor count exceeds uint32 representation")
 
         # First Party
         from lmcache_ascend.hixl_npu_comms import TransferOpDesc
@@ -277,6 +289,79 @@ class HixlTransferChannelClient:
             )
         return descs
 
+    def submit_read(
+        self,
+        local_addresses: list[TransferChannelAddress],
+        remote_addresses: list[TransferChannelAddress],
+    ) -> int:
+        """Submit one batch and return a Client-local ID after registration.
+
+        No retry or reconnect is performed. A submission error does not prove
+        that no data was accessed. Preparing the snapshot before the native call
+        reduces Python work after submission, but task insertion can still fail;
+        this path does not provide transactional registration or request drain.
+        """
+        # First Party
+        from lmcache_ascend.v1.hixl_runtime import use_acl_context
+        import lmcache_ascend.hixl_npu_comms as hixl_comms
+
+        remote_snapshot = list(remote_addresses)
+        descs = self._build_read_descriptors(local_addresses, remote_snapshot)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("HIXL Client is closed")
+            with self._context._engine_lock:
+                self._context._check_connection_locked(self.connection)
+                assert self._context._engine is not None
+                with use_acl_context(self._context._acl_context):
+                    req = self._context._engine.transfer_async(
+                        self.peer_metadata.engine_id, hixl_comms.TransferOp.READ, descs
+                    )
+                if req == 0:
+                    raise RuntimeError("HIXL TransferAsync returned a null request")
+            task_id = self._task_counter
+            self._task_counter += 1
+            self._tasks[task_id] = (req, remote_snapshot)
+            return task_id
+
+    def query_read_status(self, task_id: int) -> TransferChannelReadResult:
+        """Query once; consume terminal tasks and never reuse a failed native req."""
+        # Third Party
+        from lmcache.v1.distributed.transfer_channel.api import (
+            TransferChannelReadResult,
+        )
+
+        # First Party
+        from lmcache_ascend.v1.hixl_runtime import use_acl_context
+        import lmcache_ascend.hixl_npu_comms as hixl_comms
+
+        with self._lock:
+            req, addresses = self._tasks[task_id]
+            with self._context._engine_lock:
+                if self.connection.failure is not None:
+                    del self._tasks[task_id]
+                    return TransferChannelReadResult(True, [False] * len(addresses))
+                self._context._check_connection_locked(self.connection)
+                assert self._context._engine is not None
+                with use_acl_context(self._context._acl_context):
+                    try:
+                        status = self._context._engine.get_transfer_status(req)
+                    except hixl_comms.HixlError as error:
+                        # Catch only the query call, not ACL scope preparation.
+                        del self._tasks[task_id]
+                        self._context._fail_connection_locked(self.connection, error)
+                        raise
+            if status == hixl_comms.TransferStatus.WAITING:
+                return TransferChannelReadResult(False, [])
+            # HIXL removes the req index for every non-WAITING status, including
+            # unsupported ones. Never leave that request available for requery.
+            del self._tasks[task_id]
+            if status == hixl_comms.TransferStatus.COMPLETED:
+                return TransferChannelReadResult(True, [True] * len(addresses))
+            if status == hixl_comms.TransferStatus.FAILED:
+                return TransferChannelReadResult(True, [False] * len(addresses))
+            raise RuntimeError(f"Unsupported HIXL transfer status: {status!r}")
+
     @property
     def closed(self) -> bool:
         with self._lock:
@@ -285,6 +370,9 @@ class HixlTransferChannelClient:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            # This invalidates IDs, not native accesses. Connection/engine
+            # cleanup owns remaining native resources; no per-request free.
+            self._tasks.clear()
 
 
 class HixlTransferChannelServer:
@@ -347,7 +435,7 @@ class HixlTransferChannelServer:
 class HixlTransferChannelContext:
     """Own one engine and full L1 registration; borrow memory and ACL context.
 
-    This stage prepares peer Clients, but does not yet implement READ.
+    Clients submit and query READs through this shared engine.
     The L1 owner must provide a live HIXL-compatible Host allocation and retain
     it through deregistration.
     Construction retains the selected device on the initializing thread.
@@ -505,6 +593,66 @@ class HixlTransferChannelContext:
                     "Failed to close HIXL Client for %s", peer_advertise_url
                 )
 
+    def _check_connection_locked(self, record: _HixlConnection) -> None:
+        """Require the same usable record; caller holds the engine lock."""
+        if self._engine is None:
+            raise RuntimeError("HIXL engine is closed")
+        if (
+            not record.connected
+            or self._connections.get(record.metadata.engine_id) is not record
+        ):
+            raise RuntimeError("HIXL peer connection is not usable")
+
+    def _disconnect_connection_locked(self, record: _HixlConnection) -> None:
+        """Attempt owned cleanup in a fresh ACL scope; retain diagnostics.
+
+        Caller holds the engine lock and selects the attempt (fault or final
+        exit). NOT_CONNECTED is benign for this attempt, but does not certify
+        historical cleanup or make this record eligible for recovery.
+        """
+        # First Party
+        from lmcache_ascend.v1.hixl_runtime import use_acl_context
+        import lmcache_ascend.hixl_npu_comms as hixl_comms
+
+        try:
+            if self._engine is None:
+                raise RuntimeError("HIXL engine is closed")
+            with use_acl_context(self._acl_context):
+                self._engine.disconnect(
+                    record.metadata.engine_id, timeout_ms=_DISCONNECT_TIMEOUT_MS
+                )
+            record.disconnect_succeeded = True
+        except Exception as error:
+            if record.disconnect_error is None:
+                record.disconnect_error = f"{type(error).__name__}: {error}"
+            if not (
+                isinstance(error, hixl_comms.HixlError)
+                and error.code == hixl_comms.HIXL_NOT_CONNECTED
+            ):
+                logger.exception(
+                    "Failed to disconnect HIXL peer %s", record.metadata.engine_id
+                )
+
+    def _fail_connection_locked(
+        self, record: _HixlConnection, error: Exception
+    ) -> None:
+        """Invalidate one record and attempt cleanup once, under the engine lock.
+
+        No other Client lock is acquired. Its tasks observe this record on their
+        next query. Store text, not an exception traceback retaining resources.
+        """
+        if record.failure is not None:
+            return
+        record.failure = f"{type(error).__name__}: {error}"
+        record.connected = False
+        if (
+            self._engine is None
+            or self._connections.get(record.metadata.engine_id) is not record
+        ):
+            record.disconnect_error = "Connection is no longer owned by this engine"
+            return
+        self._disconnect_connection_locked(record)
+
     def _ensure_connection(self, metadata: HixlChannelMetadata) -> _HixlConnection:
         """Validate, reuse or connect under one engine lock; never hot-replace."""
         # First Party
@@ -575,7 +723,6 @@ class HixlTransferChannelContext:
         """
         # First Party
         from lmcache_ascend.v1.hixl_runtime import use_acl_context
-        import lmcache_ascend.hixl_npu_comms as hixl_comms
 
         with self._clients_lock:
             server = self._server
@@ -597,24 +744,14 @@ class HixlTransferChannelContext:
         with self._engine_lock:
             if self._engine is None:
                 return
-            for engine_id, record in self._connections.items():
-                if not record.connected:
+            for record in self._connections.values():
+                if record.disconnect_succeeded or record.close_attempted:
                     continue
-                try:
-                    with use_acl_context(self._acl_context):
-                        try:
-                            self._engine.disconnect(
-                                engine_id, timeout_ms=_DISCONNECT_TIMEOUT_MS
-                            )
-                        except hixl_comms.HixlError as exc:
-                            if exc.code != hixl_comms.HIXL_NOT_CONNECTED:
-                                raise
-                        finally:
-                            # No retries after a native attempt, including an
-                            # error; this is not proof that the peer drained.
-                            record.connected = False
-                except Exception:
-                    logger.exception("Failed to disconnect HIXL peer %s", engine_id)
+                # A failed/uncertain fault cleanup gets one final exit attempt.
+                # Sequential close does not replay that attempt if Finalize fails.
+                record.close_attempted = True
+                record.connected = False
+                self._disconnect_connection_locked(record)
             if self._mem_handle is not None:
                 try:
                     with use_acl_context(self._acl_context):
