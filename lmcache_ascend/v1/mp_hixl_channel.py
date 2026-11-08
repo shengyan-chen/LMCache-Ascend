@@ -26,6 +26,10 @@ import zmq
 if TYPE_CHECKING:
     # Third Party
     from lmcache.v1.distributed.internal_api import L1MemoryDesc
+    from lmcache.v1.distributed.transfer_channel.api import TransferChannelAddress
+
+    # First Party
+    from lmcache_ascend.hixl_npu_comms import TransferOpDesc
 
 logger = logging.getLogger(__name__)
 _ENV_PREFIX = "LMCACHE_HIXL_"
@@ -67,6 +71,23 @@ def _validate_memory_range(ptr: int, size: int) -> None:
         or size > _UINTPTR_MAX - ptr
     ):
         raise ValueError(f"Invalid Host memory range: ptr={ptr!r}, size={size!r}")
+
+
+def _validate_address_range(
+    offset: int, size: int, buffer_size: int, *, label: str
+) -> None:
+    """Check a subrange of an already validated, native-representable pool."""
+    if type(offset) is not int or type(size) is not int:
+        raise ValueError(f"{label}: offset and size must be integers, not bool")
+    if offset < 0 or size <= 0:
+        raise ValueError(
+            f"{label}: require offset >= 0 and size > 0, got {offset}, {size}"
+        )
+    if offset > buffer_size or size > buffer_size - offset:
+        raise ValueError(
+            f"{label}: range offset={offset}, size={size} "
+            f"exceeds buffer_size={buffer_size}"
+        )
 
 
 def _parse_channel_url(url: str) -> tuple[str, int]:
@@ -191,8 +212,8 @@ class _HixlConnection:
 class HixlTransferChannelClient:
     """Borrow a shared connection and retain its immutable peer snapshot.
 
-    This stage only supports lifecycle management. READ and task state follow
-    separately; closing a Client never disconnects the Context's connection.
+    This stage supports lifecycle and READ parameter preparation. Submission
+    and task state follow separately; closing never disconnects the connection.
     """
 
     def __init__(
@@ -203,6 +224,58 @@ class HixlTransferChannelClient:
         self.peer_metadata = connection.metadata
         self._lock = Lock()
         self._closed = False
+
+    def _build_read_descriptors(
+        self,
+        local_addresses: list[TransferChannelAddress],
+        remote_addresses: list[TransferChannelAddress],
+    ) -> list[TransferOpDesc]:
+        """Validate a whole READ batch and describe exact remote-to-local ranges.
+
+        Pools were validated at registration/admission, so a contained subrange
+        also fits uintptr_t/size_t. No alignment, copying, native engine calls
+        or ACL scope is needed here. The later submit path checks connection
+        usability and retains these descriptors through the native call.
+        """
+        if len(local_addresses) != len(remote_addresses):
+            raise ValueError("Local and remote address count must match")
+        if not local_addresses:
+            raise ValueError("READ address batch must not be empty")
+
+        # First Party
+        from lmcache_ascend.hixl_npu_comms import TransferOpDesc
+
+        local_pool = self._context.metadata
+        remote_pool = self.peer_metadata
+        descs = []
+        for index, (local, remote) in enumerate(
+            zip(local_addresses, remote_addresses, strict=True)
+        ):
+            _validate_address_range(
+                local.offset,
+                local.size,
+                local_pool.buffer_size,
+                label=f"local_addresses[{index}]",
+            )
+            _validate_address_range(
+                remote.offset,
+                remote.size,
+                remote_pool.buffer_size,
+                label=f"remote_addresses[{index}]",
+            )
+            if local.size != remote.size:
+                raise ValueError(
+                    f"pair[{index}]: local size {local.size} "
+                    f"!= remote size {remote.size}"
+                )
+            descs.append(
+                TransferOpDesc(
+                    local_addr=local_pool.buffer_base_ptr + local.offset,
+                    remote_addr=remote_pool.buffer_base_ptr + remote.offset,
+                    len=local.size,
+                )
+            )
+        return descs
 
     @property
     def closed(self) -> bool:
@@ -345,6 +418,28 @@ class HixlTransferChannelContext:
         except BaseException:
             self.close()
             raise
+
+    def get_transfer_channel_address(
+        self, lmcache_addresses: list[tuple[int, int]]
+    ) -> list[TransferChannelAddress]:
+        """Validate local L1 ranges and retain byte offsets in the public type.
+
+        An empty list produces no addresses. This creates no allocation,
+        registration or object lock and does not prove current accessibility.
+        """
+        # Third Party
+        from lmcache.v1.distributed.transfer_channel.api import TransferChannelAddress
+
+        addresses = []
+        for index, (offset, size) in enumerate(lmcache_addresses):
+            _validate_address_range(
+                offset,
+                size,
+                self.metadata.buffer_size,
+                label=f"local_addresses[{index}]",
+            )
+            addresses.append(TransferChannelAddress(offset=offset, size=size))
+        return addresses
 
     def get_transfer_channel_server(self) -> HixlTransferChannelServer:
         if self._server is None:

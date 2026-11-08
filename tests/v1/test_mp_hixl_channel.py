@@ -519,3 +519,93 @@ def test_request_cleanup_preserves_handshake_error(backend, l1, caplog):
         assert context.get_num_connected_clients() == 0
     finally:
         context.close()
+
+
+@pytest.fixture
+def read_addresses(backend, l1, monkeypatch):
+    module, native, _, _, _ = backend
+    # Load the real public data types without activating upstream device plugins.
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "LMCache/lmcache/v1/distributed/transfer_channel/api.py"
+    )
+    name = "lmcache.v1.distributed.transfer_channel.api"
+    spec = importlib.util.spec_from_file_location(name, path)
+    api = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, api)
+    spec.loader.exec_module(api)
+    native.TransferOpDesc = SimpleNamespace
+    context = module.HixlTransferChannelContext(l1, LISTEN_URL, ADVERTISE_URL)
+    peer = msgspec.structs.replace(
+        context.metadata,
+        advertise_url="10.0.0.12:5555",
+        engine_id="10.0.0.12:6000",
+        buffer_base_ptr=0x800005,
+        buffer_size=1024,
+    )
+    # Address preparation needs validated metadata, not a physical connection.
+    client = module.HixlTransferChannelClient(context, module._HixlConnection(peer))
+    yield context, client, api.TransferChannelAddress
+    context.close()
+
+
+def test_local_address_conversion_preserves_offsets_and_pool_boundary(read_addresses):
+    context, _, address = read_addresses
+    assert context.get_transfer_channel_address([]) == []
+    assert context.get_transfer_channel_address([(0, 1), (4093, 3)]) == [
+        address(0, 1),
+        address(4093, 3),
+    ]
+    with pytest.raises(ValueError, match=r"local_addresses\[0\].*range"):
+        context.get_transfer_channel_address([(4093, 4)])
+
+
+@pytest.mark.parametrize("offset,size", [(True, 1), (-1, 1), (0, 0)])
+def test_local_address_rejects_invalid_integer_range(read_addresses, offset, size):
+    context, _, _ = read_addresses
+    with pytest.raises(ValueError, match=r"local_addresses\[0\]"):
+        context.get_transfer_channel_address([(offset, size)])
+
+
+def test_read_descriptors_preserve_pair_order_exact_length_and_raw_bases(
+    backend, read_addresses
+):
+    _, native, _, _, _ = backend
+    _, client, address = read_addresses
+    local = [address(128, 7), address(0, 3)]
+    remote = [address(256, 7), address(64, 3)]
+    native.Hixl.return_value.reset_mock()
+    descs = client._build_read_descriptors(local, remote)
+    assert [(d.local_addr, d.remote_addr, d.len) for d in descs] == [
+        (0x100083, 0x800105, 7),
+        (0x100003, 0x800045, 3),
+    ]
+    assert local == [address(128, 7), address(0, 3)]
+    assert remote == [address(256, 7), address(64, 3)]
+    assert native.Hixl.return_value.mock_calls == []
+
+
+@pytest.mark.parametrize(
+    "local,remote,reason",
+    [([], [], "empty"), ([(0, 8)], [], "count"), ([(0, 8)], [(0, 4)], r"pair\[0\]")],
+)
+def test_read_descriptors_reject_invalid_batch(read_addresses, local, remote, reason):
+    _, client, address = read_addresses
+    with pytest.raises(ValueError, match=reason):
+        client._build_read_descriptors(
+            [address(*item) for item in local], [address(*item) for item in remote]
+        )
+
+
+def test_later_remote_range_error_rejects_batch_without_transfer(
+    backend, read_addresses
+):
+    _, native, _, _, _ = backend
+    _, client, address = read_addresses
+    native.Hixl.return_value.reset_mock()
+    with pytest.raises(ValueError, match=r"remote_addresses\[1\].*1024"):
+        client._build_read_descriptors(
+            [address(32, 128), address(256, 128)],
+            [address(0, 128), address(960, 128)],
+        )
+    assert native.Hixl.return_value.mock_calls == []
