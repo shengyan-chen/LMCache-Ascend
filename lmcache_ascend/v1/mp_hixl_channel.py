@@ -481,8 +481,9 @@ class HixlTransferChannelContext(TransferChannelContext):
         except (ImportError, OSError) as exc:
             raise RuntimeError(
                 "Failed to load the HIXL native extension "
-                "lmcache_ascend.hixl_npu_comms; build LMCache-Ascend with "
-                "USE_HIXL=1 and make its runtime libraries available"
+                "lmcache_ascend.hixl_npu_comms; check CANN version detection "
+                "during the LMCache-Ascend build, confirm the HIXL extension "
+                "was built, and make its runtime libraries available"
             ) from exc
 
         options = self._config.initialize_options()
