@@ -34,11 +34,24 @@ def l1():
 
 @pytest.fixture
 def backend(monkeypatch):
+    before = set(sys.modules)
     root = Path(__file__).resolve().parents[2] / "lmcache_ascend"
     for name, path in [("lmcache_ascend", root), ("lmcache_ascend.v1", root / "v1")]:
         package = ModuleType(name)
         package.__path__ = [str(path)]
         monkeypatch.setitem(sys.modules, name, package)
+    # Use the real public ABC/API without initializing upstream devices or
+    # importing the native memory manager behind its L1 type annotation.
+    upstream = root.parents[1] / "LMCache/lmcache"
+    for suffix in ["", ".v1", ".v1.distributed", ".v1.distributed.transfer_channel"]:
+        name = "lmcache" + suffix
+        package = ModuleType(name)
+        package.__path__ = [str(upstream.joinpath(*suffix.strip(".").split(".")))]
+        monkeypatch.setitem(sys.modules, name, package)
+    internal_api = ModuleType("lmcache.v1.distributed.internal_api")
+    internal_api.L1MemoryDesc = SimpleNamespace
+    monkeypatch.setitem(sys.modules, internal_api.__name__, internal_api)
+    importlib.import_module("lmcache.v1.distributed.transfer_channel.abstract")
     for suffix in ["mp_hixl_channel", "hixl_runtime"]:
         monkeypatch.delitem(sys.modules, f"lmcache_ascend.v1.{suffix}", raising=False)
     native = ModuleType("lmcache_ascend.hixl_npu_comms")
@@ -85,6 +98,9 @@ def backend(monkeypatch):
     # Imported modules are not themselves installed by monkeypatch.
     for suffix in ["mp_hixl_channel", "hixl_runtime"]:
         sys.modules.pop(f"lmcache_ascend.v1.{suffix}", None)
+    for name in set(sys.modules) - before:
+        if name.startswith("lmcache."):
+            sys.modules.pop(name, None)
 
 
 def test_default_engine_lifecycle_uses_lock_and_borrowed_context(backend, l1):
@@ -528,18 +544,9 @@ def test_request_cleanup_preserves_handshake_error(backend, l1, caplog):
 
 
 @pytest.fixture
-def read_addresses(backend, l1, monkeypatch):
+def read_addresses(backend, l1):
     module, native, _, _, _ = backend
-    # Load the real public data types without activating upstream device plugins.
-    path = (
-        Path(__file__).resolve().parents[3]
-        / "LMCache/lmcache/v1/distributed/transfer_channel/api.py"
-    )
-    name = "lmcache.v1.distributed.transfer_channel.api"
-    spec = importlib.util.spec_from_file_location(name, path)
-    api = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, api)
-    spec.loader.exec_module(api)
+    api = importlib.import_module("lmcache.v1.distributed.transfer_channel.api")
     native.TransferOpDesc = SimpleNamespace
     context = module.HixlTransferChannelContext(l1, LISTEN_URL, ADVERTISE_URL)
     peer = msgspec.structs.replace(
@@ -946,3 +953,25 @@ def test_failed_readmission_preserves_old_record(backend, read_tasks):
         client.peer_metadata.engine_id, timeout_ms=10000
     )
     native.Hixl.return_value.transfer_async.assert_not_called()
+
+
+def test_channel_implements_public_interfaces(local_contexts):
+    abstract = importlib.import_module(
+        "lmcache.v1.distributed.transfer_channel.abstract"
+    )
+    a, _ = local_contexts()
+    b, _ = local_contexts()
+    assert isinstance(a, abstract.TransferChannelContext)
+    assert isinstance(a.get_transfer_channel_server(), abstract.TransferChannelServer)
+    client = a.get_transfer_channel_client(b.metadata.advertise_url)
+    assert isinstance(client, abstract.TransferChannelClient)
+
+
+def test_native_import_failure_preserves_cause_before_runtime(backend, l1, monkeypatch):
+    module, native, npu, _, _ = backend
+    monkeypatch.setitem(sys.modules, "lmcache_ascend.hixl_npu_comms", None)
+    with pytest.raises(RuntimeError, match="HIXL native extension") as caught:
+        module.HixlTransferChannelContext(l1, LISTEN_URL, ADVERTISE_URL)
+    assert isinstance(caught.value.__cause__, ModuleNotFoundError)
+    npu.set_device.assert_not_called()
+    native.Hixl.assert_not_called()

@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MP HIXL lifecycle, peer admission and asynchronous READ task management.
-
-Public factory integration is not implemented yet.
-"""
+"""MP HIXL lifecycle, peer admission and asynchronous READ task management."""
 
 # Future
 from __future__ import annotations
@@ -20,6 +17,11 @@ import re
 import socket
 
 # Third Party
+from lmcache.v1.distributed.transfer_channel.abstract import (
+    TransferChannelClient,
+    TransferChannelContext,
+    TransferChannelServer,
+)
 import msgspec
 import zmq
 
@@ -217,7 +219,7 @@ class _HixlConnection:
     close_attempted: bool = False
 
 
-class HixlTransferChannelClient:
+class HixlTransferChannelClient(TransferChannelClient):
     """Borrow a shared connection and retain its immutable peer snapshot.
 
     Tasks belong to this Client; a shared connection fault affects all of its
@@ -368,6 +370,11 @@ class HixlTransferChannelClient:
             return self._closed
 
     def close(self) -> None:
+        """Invalidate local task IDs without cancelling or draining native reads.
+
+        The caller must end use of this Client. Shared connection and engine
+        cleanup belong to the Context; this method does not disconnect peers.
+        """
         with self._lock:
             self._closed = True
             # This invalidates IDs, not native accesses. Connection/engine
@@ -375,7 +382,7 @@ class HixlTransferChannelClient:
             self._tasks.clear()
 
 
-class HixlTransferChannelServer:
+class HixlTransferChannelServer(TransferChannelServer):
     """Exchange metadata; complete reverse admission before replying success."""
 
     def __init__(self, context: HixlTransferChannelContext, listen_url: str) -> None:
@@ -432,7 +439,7 @@ class HixlTransferChannelServer:
             self._socket.close(linger=0)
 
 
-class HixlTransferChannelContext:
+class HixlTransferChannelContext(TransferChannelContext):
     """Own one engine and full L1 registration; borrow memory and ACL context.
 
     Clients submit and query READs through this shared engine.
@@ -467,7 +474,16 @@ class HixlTransferChannelContext:
             prepare_acl_context,
             use_acl_context,
         )
-        import lmcache_ascend.hixl_npu_comms as hixl_comms
+
+        try:
+            # First Party
+            import lmcache_ascend.hixl_npu_comms as hixl_comms
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                "Failed to load the HIXL native extension "
+                "lmcache_ascend.hixl_npu_comms; build LMCache-Ascend with "
+                "USE_HIXL=1 and make its runtime libraries available"
+            ) from exc
 
         options = self._config.initialize_options()
         self._acl_context = prepare_acl_context(self._config.device_id)
