@@ -30,13 +30,11 @@ from lmcache.v1.client.worker_transfer import (  # noqa: E402
     LMCacheDrivenTransferContext,
     create_transfer_context,
 )
+from lmcache.v1.common.custom_types import IPCCacheServerKey  # noqa: E402
 from lmcache.v1.common.utils import LayoutHints  # noqa: E402
 from lmcache.v1.distributed.api import ObjectKey  # noqa: E402
-from lmcache.v1.multiprocess.custom_types import (  # noqa: E402
-    IPCCacheServerKey,
-    KVCache,
-)
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer  # noqa: E402
+from lmcache.v1.platform.base.ipc_wrapper import KVCache  # noqa: E402
 from lmcache.v1.platform.devices.npu.ipc_wrapper import NpuIPCWrapper  # noqa: E402
 import lmcache.lmcache_native as lmcache_native  # noqa: E402
 
