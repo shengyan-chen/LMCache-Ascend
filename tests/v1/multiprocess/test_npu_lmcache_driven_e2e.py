@@ -34,7 +34,9 @@ from lmcache.v1.common.custom_types import IPCCacheServerKey  # noqa: E402
 from lmcache.v1.common.utils import LayoutHints  # noqa: E402
 from lmcache.v1.distributed.api import ObjectKey  # noqa: E402
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer  # noqa: E402
-from lmcache.v1.platform.base.ipc_wrapper import KVCache  # noqa: E402
+from lmcache.v1.multiprocess.object_group_transfer import (  # noqa: E402
+    transfer_kv_per_object_group,
+)
 from lmcache.v1.platform.devices.npu.ipc_wrapper import NpuIPCWrapper  # noqa: E402
 import lmcache.lmcache_native as lmcache_native  # noqa: E402
 
@@ -254,7 +256,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
         # One wrapper per layer; to_tensor() yields the (latent, rope)
         # plane tuple, so discovery classifies the MLA tuple layout from
         # the in-band structure alone -- no regroup hint involved.
-        kv_caches: KVCache = list(decoder.decode(message["wrappers"]))
+        kv_caches: list[NpuIPCWrapper] = list(decoder.decode(message["wrappers"]))
 
         # Third Party
         from lmcache.v1.platform.devices.npu import NpuDeviceSpec
@@ -266,6 +268,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
             layout_hints=LayoutHints(kv_layout="NHD"),
             engine_group_infos=(),
             engine_type=EngineType.VLLM,
+            object_group_transfer=transfer_kv_per_object_group,
         )
         with closing(cache_context):
             assert (
@@ -294,6 +297,7 @@ def test_lmcache_driven_store_and_retrieve_roundtrip(
                     cache_context=cache_context,
                     model_name="mla-e2e",
                     world_size=1,
+                    chunk_size=CHUNK,
                     event_backend=event_backend,
                 )
                 monkeypatch.setattr(
